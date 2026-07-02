@@ -9,7 +9,8 @@
       "kind": "handler",
       "description": "Deterministic global scheduler object: a job is one due datetime + one stamped message to one allowlisted target; trust-gated, persistent via injectable store, retry/backoff",
       "docs": "README.md",
-      "skill": ".claude/skills/genswarms-cron-use/SKILL.md"
+      "skill": ".claude/skills/genswarms-cron-use/SKILL.md",
+      "module": "Genswarms.Cron"
     },
     {
       "name": "browse",
@@ -17,7 +18,8 @@
       "kind": "handler",
       "description": "Allowlist-capped web browser object for agents: render/click/type/back with compact replies (context-bloat safe), off-cage redirect containment",
       "docs": "README.md",
-      "skill": ".claude/skills/genswarms-browse-use/SKILL.md"
+      "skill": ".claude/skills/genswarms-browse-use/SKILL.md",
+      "module": "Genswarms.Browse"
     },
     {
       "name": "metrics",
@@ -25,7 +27,8 @@
       "kind": "handler",
       "description": "Fire-and-forget operational counters object: closed key allowlist, in-memory totals, periodic flush to an injectable durable store",
       "docs": "README.md",
-      "skill": ".claude/skills/genswarms-metrics-use/SKILL.md"
+      "skill": ".claude/skills/genswarms-metrics-use/SKILL.md",
+      "module": "Genswarms.Metrics"
     }
   ]
 }

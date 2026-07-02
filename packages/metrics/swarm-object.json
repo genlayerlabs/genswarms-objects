@@ -1,0 +1,4 @@
+{
+  "module": "Genswarms.Metrics",
+  "files": ["metrics.ex"]
+}
