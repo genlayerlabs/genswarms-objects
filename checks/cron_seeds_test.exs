@@ -290,7 +290,7 @@ check.(
 )
 
 # ── Vector 8 (I3): poisoned store row (running + bad cron expr + misfire skip) must not crash boot ──
-# recover_running_job's skip branch hits Schedule.next_after on the corrupt expr;
+# Job.recover's skip branch hits Schedule.next_after on the corrupt expr;
 # a {:error, _} there used to CaseClauseError straight out of init (boot crash-loop).
 
 bad_expr_row = %{
