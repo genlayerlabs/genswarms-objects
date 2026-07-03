@@ -1,0 +1,4 @@
+{
+  "module": "Genswarms.Tips",
+  "files": ["tips_core.ex", "tips.ex"]
+}
