@@ -1202,6 +1202,14 @@ defmodule Genswarms.Cron do
     }
   end
 
+  # canonical persisted shape first (Schedule.normalize/2 output), then the
+  # pre-normalize input shapes (flat test stores hand those in)
+  defp describe_schedule(%{"kind" => "cron", "expr" => expr}), do: "cron " <> to_string(expr)
+
+  defp describe_schedule(%{"kind" => "every_ms", "every_ms" => ms}) when is_integer(ms),
+    do: "every #{div(ms, 1000)}s"
+
+  defp describe_schedule(%{"kind" => "run_at", "run_at_ms" => ms}), do: "once @ " <> format_run_at(ms)
   defp describe_schedule(%{"cron" => expr}), do: "cron " <> to_string(expr)
   defp describe_schedule(%{"every_ms" => ms}) when is_integer(ms), do: "every #{div(ms, 1000)}s"
   defp describe_schedule(%{"run_at" => at}), do: "once @ " <> format_run_at(at)

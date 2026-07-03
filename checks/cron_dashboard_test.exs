@@ -79,7 +79,7 @@ defmodule Genswarms.CronDashboardTest do
               "id" => 7,
               "name" => "tips",
               "state" => "active",
-              "schedule" => %{"cron" => "0 10 * * *"},
+              "schedule" => %{"kind" => "cron", "expr" => "0 10 * * *"},
               "payload" => %{"target" => "proactive"},
               "next_run_at" => 1_783_150_000_000,
               "last_status" => "ok",
