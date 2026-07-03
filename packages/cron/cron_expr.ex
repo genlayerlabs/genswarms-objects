@@ -47,10 +47,6 @@ defmodule Genswarms.Cron.CronExpr do
         {:error, r} -> {:halt, {:error, r}}
       end
     end)
-    |> case do
-      {:ok, []} -> {:error, "empty cron field"}
-      other -> other
-    end
   end
 
   defp part(p, lo, hi) do
@@ -84,7 +80,8 @@ defmodule Genswarms.Cron.CronExpr do
       MapSet.member?(expr.months, dt.month) and day_match?(expr, dt)
   end
 
-  @search_days 1830  # ~5 years; an expression with no match in this window is unsatisfiable
+  # inclusive 0..1830 scan: 1831 days, roughly 5 years
+  @search_days 1830
 
   @doc "Smallest match strictly greater than from_ms, or :none within the search bound."
   def next(expr, from_ms) when is_integer(from_ms) do
@@ -98,7 +95,9 @@ defmodule Genswarms.Cron.CronExpr do
         floor_tod = if d == 0, do: start.hour * 60 + start.minute, else: 0
 
         case Enum.find(expr.tod, &(&1 >= floor_tod)) do
-          nil -> {:cont, :none}
+          nil ->
+            {:cont, :none}
+
           tod ->
             {:ok, dt} = DateTime.new(date, Time.new!(div(tod, 60), rem(tod, 60), 0), "Etc/UTC")
             {:halt, {:ok, DateTime.to_unix(dt, :millisecond)}}
