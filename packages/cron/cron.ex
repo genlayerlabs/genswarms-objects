@@ -1174,13 +1174,21 @@ defmodule Genswarms.Cron do
 
   defp safe_load_jobs(store_mod) do
     if Code.ensure_loaded?(store_mod) and function_exported?(store_mod, :load_cron_jobs, 1) do
-      store_mod.load_cron_jobs(@load_states) || []
+      # Same normalization as boot: store rows are {id, state, data-json} wrappers;
+      # normalize_loaded_job unwraps to the atom-keyed job map job_row reads.
+      (store_mod.load_cron_jobs(@load_states) || [])
+      |> Enum.map(&normalize_row_for_dashboard/1)
     else
       []
     end
   rescue
     _ -> []
   end
+
+  # Rows may arrive as raw store wrappers (%{id, state, data}) or as already-flat
+  # job maps (test stores) — normalize the former, pass the latter through.
+  defp normalize_row_for_dashboard(%{data: %{} = _} = row), do: normalize_loaded_job(row)
+  defp normalize_row_for_dashboard(row), do: row
 
   defp job_row(job) do
     %{

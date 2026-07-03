@@ -68,6 +68,37 @@ defmodule Genswarms.CronDashboardTest do
     assert outreach_row["next_run"] == "—"
   end
 
+  test "raw store wrapper rows ({id, state, data-json}) normalize like boot does" do
+    defmodule WrapperStore do
+      def load_cron_jobs(_states) do
+        [
+          %{
+            id: 7,
+            state: "active",
+            data: %{
+              "id" => 7,
+              "name" => "tips",
+              "state" => "active",
+              "schedule" => %{"cron" => "0 10 * * *"},
+              "payload" => %{"target" => "proactive"},
+              "next_run_at" => 1_783_150_000_000,
+              "last_status" => "ok",
+              "consecutive_failures" => 0
+            }
+          }
+        ]
+      end
+    end
+
+    %{"dashboard_pages" => [page]} = Genswarms.Cron.dashboard_extension(store_mod: WrapperStore)
+    [_, table] = page["sections"]
+    assert [row] = table["rows"]
+    assert row["name"] == "tips"
+    assert row["schedule"] == "cron 0 10 * * *"
+    assert row["target"] == "proactive"
+    assert row["last_status"] == "ok"
+  end
+
   test "a dead store never raises out of the extension" do
     assert %{"dashboard_pages" => [page]} =
              Genswarms.Cron.dashboard_extension(store_mod: NoSuchStoreModule)
