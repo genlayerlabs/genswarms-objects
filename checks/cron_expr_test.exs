@@ -54,6 +54,24 @@ check.("daily8 only at 08:00",
   CronExpr.match?(daily8, ms.("2026-07-06T08:00:00Z")) and
   not CronExpr.match?(daily8, ms.("2026-07-06T20:00:00Z")))
 
+check.("next: hourly from :17 → :00 next hour",
+  CronExpr.next(hourly, ms.("2026-07-06T14:17:00Z")) == {:ok, ms.("2026-07-06T15:00:00Z")})
+
+check.("next is STRICTLY future (from an exact match → the following one)",
+  CronExpr.next(hourly, ms.("2026-07-06T14:00:00Z")) == {:ok, ms.("2026-07-06T15:00:00Z")})
+
+check.("next crosses month and year boundaries",
+  CronExpr.next(daily8, ms.("2026-07-31T09:00:00Z")) == {:ok, ms.("2026-08-01T08:00:00Z")} and
+  CronExpr.next(daily8, ms.("2026-12-31T09:00:00Z")) == {:ok, ms.("2027-01-01T08:00:00Z")})
+
+{:ok, feb29} = CronExpr.parse("0 0 29 2 *")
+check.("leap-day expression finds Feb 29 2028",
+  CronExpr.next(feb29, ms.("2026-07-06T00:00:00Z")) == {:ok, ms.("2028-02-29T00:00:00Z")})
+
+{:ok, feb30} = CronExpr.parse("0 0 30 2 *")
+check.("unsatisfiable expression returns :none within the bound (never loops)",
+  CronExpr.next(feb30, ms.("2026-07-06T00:00:00Z")) == :none)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do

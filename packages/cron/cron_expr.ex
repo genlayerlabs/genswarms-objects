@@ -84,9 +84,34 @@ defmodule Genswarms.Cron.CronExpr do
       MapSet.member?(expr.months, dt.month) and day_match?(expr, dt)
   end
 
-  defp day_match?(expr, dt) do
-    dom_ok = MapSet.member?(expr.dom, dt.day)
-    dow_ok = MapSet.member?(expr.dow, Date.day_of_week(dt) |> rem(7))
+  @search_days 1830  # ~5 years; an expression with no match in this window is unsatisfiable
+
+  @doc "Smallest match strictly greater than from_ms, or :none within the search bound."
+  def next(expr, from_ms) when is_integer(from_ms) do
+    from_min = div(from_ms, 60_000)
+    start = DateTime.from_unix!((from_min + 1) * 60, :second)
+
+    Enum.reduce_while(0..@search_days, :none, fn d, _ ->
+      date = Date.add(DateTime.to_date(start), d)
+
+      if MapSet.member?(expr.months, date.month) and day_match?(expr, date) do
+        floor_tod = if d == 0, do: start.hour * 60 + start.minute, else: 0
+
+        case Enum.find(expr.tod, &(&1 >= floor_tod)) do
+          nil -> {:cont, :none}
+          tod ->
+            {:ok, dt} = DateTime.new(date, Time.new!(div(tod, 60), rem(tod, 60), 0), "Etc/UTC")
+            {:halt, {:ok, DateTime.to_unix(dt, :millisecond)}}
+        end
+      else
+        {:cont, :none}
+      end
+    end)
+  end
+
+  defp day_match?(expr, d) do
+    dom_ok = MapSet.member?(expr.dom, d.day)
+    dow_ok = MapSet.member?(expr.dow, Date.day_of_week(d) |> rem(7))
 
     case {expr.dom_restricted?, expr.dow_restricted?} do
       {true, true} -> dom_ok or dow_ok
