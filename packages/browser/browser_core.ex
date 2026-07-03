@@ -18,18 +18,19 @@ defmodule Genswarms.Browser.Core do
   @max_redirects 3
 
   @type resolver :: (String.t() -> {:ok, [:inet.ip_address()]} | {:error, term()})
+  @type policy :: {:allow, MapSet.t(String.t())} | {:deny, MapSet.t(String.t())}
 
   @doc """
   Gate a URL the agent wants opened. THE sole gate (agent-browser does not gate the
   open target). `resolver` is injected for testability; defaults to real DNS.
   """
-  @spec gate(String.t(), MapSet.t(String.t()), resolver()) :: :ok | {:error, term()}
-  def gate(url, allowset, resolver \\ &resolve_host/1) do
+  @spec gate(String.t(), policy(), resolver()) :: :ok | {:error, term()}
+  def gate(url, policy, resolver \\ &resolve_host/1) do
     with {:ok, uri} <- parse(url),
          :ok <- https_only(uri),
          :ok <- no_userinfo(uri),
          :ok <- ok_port(uri),
-         :ok <- allowed?(uri.host, allowset),
+         :ok <- membership(uri.host, policy),
          :ok <- ssrf_safe?(uri.host, resolver) do
       :ok
     end
@@ -52,8 +53,13 @@ defmodule Genswarms.Browser.Core do
   defp ok_port(%URI{port: p}) when p in [nil, 443], do: :ok
   defp ok_port(%URI{port: p}), do: {:error, {:bad_port, p}}
 
-  defp allowed?(host, allowset) do
-    if MapSet.member?(allowset, String.downcase(host)), do: :ok, else: {:error, {:not_allowed, host}}
+  # Allowlist: exact-host membership (unchanged semantics). Denylist: pass unless blocked.
+  defp membership(host, {:allow, set}) do
+    if MapSet.member?(set, String.downcase(host)), do: :ok, else: {:error, {:not_allowed, host}}
+  end
+
+  defp membership(host, {:deny, set}) do
+    if blocked?(host, set), do: {:error, {:not_allowed, host}}, else: :ok
   end
 
   @doc "Normalize a host for matching: lowercase, strip one trailing dot, punycode→ascii."
@@ -154,19 +160,19 @@ defmodule Genswarms.Browser.Core do
   is only ever pointed at a fully-validated terminal URL. `opts[:fetcher]` and
   `opts[:resolver]` are injected for tests; defaults hit the network via `curl`.
   """
-  @spec resolve_redirects(String.t(), MapSet.t(String.t()), keyword()) :: {:ok, String.t()} | {:error, term()}
-  def resolve_redirects(url, allowset, opts \\ []) do
+  @spec resolve_redirects(String.t(), policy(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_redirects(url, policy, opts \\ []) do
     fetcher = Keyword.get(opts, :fetcher, &http_head/1)
     resolver = Keyword.get(opts, :resolver, &resolve_host/1)
-    follow(url, allowset, fetcher, resolver, @max_redirects)
+    follow(url, policy, fetcher, resolver, @max_redirects)
   end
 
-  defp follow(_url, _allow, _fetcher, _resolver, 0), do: {:error, :too_many_redirects}
-  defp follow(url, allowset, fetcher, resolver, n) do
-    with :ok <- gate(url, allowset, resolver) do
+  defp follow(_url, _policy, _fetcher, _resolver, 0), do: {:error, :too_many_redirects}
+  defp follow(url, policy, fetcher, resolver, n) do
+    with :ok <- gate(url, policy, resolver) do
       case fetcher.(url) do
         {status, loc} when status in 300..399 and is_binary(loc) ->
-          follow(URI.merge(URI.parse(url), loc) |> URI.to_string(), allowset, fetcher, resolver, n - 1)
+          follow(URI.merge(URI.parse(url), loc) |> URI.to_string(), policy, fetcher, resolver, n - 1)
         {status, nil} when status in 300..399 ->
           {:error, {:missing_location, status}}
         {status, _} when status in 200..299 ->
