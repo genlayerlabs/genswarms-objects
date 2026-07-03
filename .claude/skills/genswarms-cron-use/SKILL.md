@@ -81,6 +81,11 @@ one-shot due-value aliases for `run_at` (schedule resolution order:
 callers should use `run_at`; the aliases exist only for callers already
 depending on them and may be removed.
 
+`"origin"` (optional) is a free-form scalar-valued provenance map —
+`{"campaign_id": "c1", "score": 7}` — persisted on the job for audit; any
+non-scalar value is dropped, and `"source"` defaults to the creating
+sender if not supplied.
+
 ## Declarative seeding
 
 The `seed_jobs` config upserts jobs by `dedupe_key` at init — same key, same
@@ -114,6 +119,13 @@ If a caller creates one-shot jobs repeatedly with the same `dedupe_key`
 `"once": true` — the default dedupe is the weaker of the two and will
 silently duplicate a fired one-shot.
 
+`"once": true`'s terminal-row lookup goes through `store_mod`
+(`load_cron_jobs(@terminal_states)`); without a `store_mod` wired, that
+lookup always sees no rows, so `once: true` silently degrades to the
+weaker live-only dedupe (a fired one-shot is forgotten and can duplicate on
+the next call) — `once: true` needs `store_mod` to actually deliver its
+"at most once EVER" guarantee.
+
 ## `run_now`
 
 `{"action":"run_now","job_id":1}` fires an **active** job immediately
@@ -125,7 +137,16 @@ job's scheduled `next_run_at`; on success a recurring job re-arms from that
 `{"ok":false,"error":"job not active","job_id":<id>,"state":"paused"}`;
 terminal/removed jobs get `{"ok":false,"error":"job terminal",...}` or
 `{"ok":false,"error":"job not found",...}`. Trusted-source-gated like every
-other action.
+other action. At `max_concurrency` capacity, `run_now` is rejected
+(`{"ok":false,"error":"at max concurrency",...}`) rather than deferred —
+there is no due-queue to defer an immediate-fire request onto.
+
+Re-arming after `run_now` differs by kind: `every_ms` re-phases
+**permanently** — the new `next_run_at` is anchored to the `run_now`
+occurrence itself (`now + period`), so every future occurrence shifts to
+that phase. A `cron`-kind job stays on its **absolute grid** — firing it
+early via `run_now` doesn't move `next_run_at` off the calendar points the
+expression matches.
 
 ## Misfire policy
 
