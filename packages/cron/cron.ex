@@ -27,6 +27,7 @@ defmodule Genswarms.Cron do
       store_call(store_mod, :load_cron_jobs, [@load_states], [])
       |> Enum.map(&normalize_loaded_job/1)
       |> Enum.map(&recover_running_job(&1, now))
+      |> Enum.map(&apply_load_misfire(&1, now))
       |> Map.new(fn job -> {job.id, job} end)
 
     state = %{
@@ -962,6 +963,29 @@ defmodule Genswarms.Cron do
   end
 
   defp recover_running_job(job, _now), do: job
+
+  # Load-time misfire pass for ORDINARY downtime: an ACTIVE recurring job whose
+  # stored next_run_at is already past missed occurrences while the scheduler
+  # simply wasn't running (no crash mid-run — recover_running_job handles that).
+  # "skip" advances to the next FUTURE grid point (no catch-up delivery, same
+  # grid base as the missed due); "coalesce" (default) leaves the past due in
+  # place — exactly one catch-up, unchanged behavior. One-shots are untouched
+  # (a past one-shot still fires its catch-up). Runs after recover_running_job,
+  # which never leaves a strictly-past next_run_at, so the passes don't overlap.
+  defp apply_load_misfire(%{state: "active", misfire: "skip", next_run_at: due} = job, now)
+       when is_integer(due) and due < now do
+    if Schedule.recurring?(Map.get(job, :schedule)) do
+      case Schedule.next_after(job.schedule, due, now) do
+        {:ok, next} -> %{job | next_run_at: next, updated_at: now}
+        # :none or {:error, _}: nothing to arm — same shape as a skip resume.
+        _no_next -> %{job | next_run_at: nil, updated_at: now}
+      end
+    else
+      job
+    end
+  end
+
+  defp apply_load_misfire(job, _now), do: job
 
   defp positive_int(value, default) do
     case to_id(value) do

@@ -377,6 +377,52 @@ check.(
     length(rows9_boot2) == 1
 )
 
+# ── Vector 10 (I5): misfire "skip" honored on ORDINARY downtime (active row loaded overdue) ──
+# Two identical active every_ms jobs missed 5 occurrences while the box was down
+# (not crashed mid-run): the skip one must advance to the next FUTURE grid point
+# with no catch-up delivery; the coalesce one keeps the single catch-up.
+
+hour = 3_600_000
+
+downtime_row = fn id, misfire ->
+  %{
+    id: id,
+    state: "active",
+    data: %{
+      "id" => id,
+      "name" => "downtime-#{misfire}",
+      "state" => "active",
+      "schedule" => %{"kind" => "every_ms", "every_ms" => hour},
+      "misfire" => misfire,
+      "next_run_at" => base_now - 5 * hour,
+      "last_run_at" => base_now - 6 * hour,
+      "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+      "created_at" => base_now - 100 * hour,
+      "updated_at" => base_now - 6 * hour
+    }
+  }
+end
+
+FakeStore.start([downtime_row.(60, "skip"), downtime_row.(61, "coalesce")])
+
+{state10, _clock10, sink10} = init_state.(base_now, [], %{store_mod: FakeStore})
+
+job10_skip = Map.fetch!(state10.jobs, 60)
+job10_coal = Map.fetch!(state10.jobs, 61)
+
+{:reply, tick10, state10} = tick.(state10, :ops)
+decoded_tick10 = Jason.decode!(tick10)
+job10_skip_after = Map.fetch!(state10.jobs, 60)
+
+check.(
+  "active skip job loaded 5 periods overdue: next_run_at advanced to the next FUTURE grid point at load, no catch-up delivery; coalesce twin keeps its past due and fires exactly one catch-up",
+  job10_skip.next_run_at == base_now + hour and
+    job10_coal.next_run_at == base_now - 5 * hour and
+    decoded_tick10["launched"] == 1 and
+    length(Agent.get(sink10, & &1)) == 1 and
+    job10_skip_after.next_run_at == base_now + hour
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
