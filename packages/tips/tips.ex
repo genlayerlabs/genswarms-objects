@@ -83,6 +83,29 @@ defmodule Genswarms.Tips do
 
   def handle_message(_from, content, state) do
     case Jason.decode(content) do
+      {:ok, %{"action" => "draw", "recipient_id" => r, "date" => d}}
+      when is_binary(r) and is_binary(d) ->
+        case Core.draw(state.fragments, state.seen, state.template, r, d, state.salt, state.guard) do
+          {:ok, %{text: text, rotating_ids: ids}} ->
+            {:reply, Jason.encode!(%{ok: true, text: text, fragment_ids: ids}), state}
+
+          {:error, :empty_pool} ->
+            {:reply, Jason.encode!(%{ok: false, error: "empty_pool"}), state}
+        end
+
+      {:ok, %{"action" => "commit", "recipient_id" => r, "fragment_ids" => ids}}
+      when is_binary(r) and is_list(ids) ->
+        ids = Enum.filter(ids, &is_binary/1)
+        seen_list = Map.get(state.seen, r, [])
+        {seen_list, reshuffled} = Core.commit(state.fragments, state.template, seen_list, ids, state.guard)
+        state = %{state | seen: Map.put(state.seen, r, seen_list)}
+
+        if reshuffled,
+          do: store_call(state.store, :replace_seen, [r, seen_list]),
+          else: store_call(state.store, :add_seen, [r, ids])
+
+        {:reply, Jason.encode!(%{ok: true, reshuffled: reshuffled}), state}
+
       {:ok, %{"action" => "add_fragments", "fragments" => frags}} when is_list(frags) ->
         add_fragments(frags, state)
 
