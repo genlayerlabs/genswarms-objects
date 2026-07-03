@@ -60,10 +60,46 @@ defmodule Genswarms.Browser do
 
   def init(config) do
     # No :code.priv_dir (objects are Code.require_file'd, there is no :wingston OTP app);
-    # configs pass an explicit :allowlist_path (Task 6). Env override, then a cwd default.
-    path = Map.get(config, :allowlist_path) || System.get_env("WINGSTON_BROWSE_ALLOWLIST") ||
-             Path.join(File.cwd!(), "config/browse-allowlist.txt")
-    allowset = load_allowlist(path)
+    # configs pass an explicit :allowlist_path/:blocklist_path (Task 6). Env override, then
+    # a cwd default. `mode` selects allowlist (default, back-compat) or denylist: in denylist
+    # mode there is no global allowed_domains string (the renderer isn't handed a positive
+    # list), so allowed_domains is nil and the gate/redirect logic runs off `policy` alone.
+    mode = Map.get(config, :mode, :allowlist)
+
+    {policy, allowed_domains} =
+      case mode do
+        :denylist ->
+          path =
+            Map.get(config, :blocklist_path) || System.get_env("WINGSTON_BROWSER_BLOCKLIST") ||
+              Path.join(File.cwd!(), "config/browser-blocklist.txt")
+
+          case load_hostset(path) do
+            {:ok, set} ->
+              Logger.info("browser: denylist mode — #{MapSet.size(set)} blocked host(s) from #{path}")
+              {{:deny, set}, nil}
+
+            {:error, r} ->
+              Logger.error("browser: denylist #{path} unreadable (#{inspect(r)}) — FAIL-CLOSED, blocking everything")
+              {{:allow, MapSet.new()}, nil}
+          end
+
+        _ ->
+          path =
+            Map.get(config, :allowlist_path) || System.get_env("WINGSTON_BROWSE_ALLOWLIST") ||
+              Path.join(File.cwd!(), "config/browse-allowlist.txt")
+
+          set =
+            case load_hostset(path) do
+              {:ok, s} -> s
+              {:error, _} -> MapSet.new()
+            end
+
+          if MapSet.size(set) == 0,
+            do: Logger.error("browser: allowlist #{path} empty/unreadable — fail-closed"),
+            else: Logger.info("browser: allowlist mode — #{MapSet.size(set)} host(s) from #{path}")
+
+          {{:allow, set}, Browse.allowed_domains_arg(set)}
+      end
 
     renderer = Map.get(config, :renderer, Genswarms.Browser.AgentBrowser)
     if renderer == Genswarms.Browser.AgentBrowser and System.find_executable("agent-browser") == nil,
@@ -71,9 +107,10 @@ defmodule Genswarms.Browser do
 
     {:ok,
      %{
-       allowset: allowset,
-       # the --allowed-domains string is passed to the renderer per call (no global state)
-       allowed_domains: Browse.allowed_domains_arg(allowset),
+       policy: policy,
+       # the --allowed-domains string is passed to the renderer per call (no global state);
+       # nil in denylist mode (no positive allowlist to hand the renderer).
+       allowed_domains: allowed_domains,
        renderer: renderer,
        resolver: Map.get(config, :resolver, &Browse.resolve_host/1),
        redirect_fetcher: Map.get(config, :redirect_fetcher),
@@ -183,8 +220,8 @@ defmodule Genswarms.Browser do
             do: [fetcher: state.redirect_fetcher, resolver: state.resolver],
             else: [resolver: state.resolver]
 
-        with :ok <- Browse.gate(url, state.allowset, state.resolver),
-             {:ok, final} <- Browse.resolve_redirects(url, state.allowset, ropts) do
+        with :ok <- Browse.gate(url, state.policy, state.resolver),
+             {:ok, final} <- Browse.resolve_redirects(url, state.policy, ropts) do
           {sess, state} = ensure_session(from, state)
           r = state.renderer
           ad = state.allowed_domains
@@ -297,9 +334,9 @@ defmodule Genswarms.Browser do
   # browser is sitting on an off-cage page, and any further action would interact with
   # it.
   defp deliver(from, desc, {:ok, %{landed_url: landed, text: text}}, full?, state) do
-    case Browse.gate(landed, state.allowset, state.resolver) do
+    case Browse.gate(landed, state.policy, state.resolver) do
       :ok ->
-        display(:browser_done, %{agent: from, verdict: "ok"})
+        display(:browser_done, %{agent: from, verdict: "ok", host: host_of(landed)})
         Logger.info("browse: from=#{from} act=#{desc} landed=#{landed} verdict=ok full=#{full?}")
         state = touch_session(from, state)
         {clamped, truncated?} = clamp(text, state.max_text_chars)
@@ -431,7 +468,10 @@ defmodule Genswarms.Browser do
   end
 
   # ── helpers ──
-  defp load_allowlist(path) do
+  # Returns {:ok, MapSet} on a readable file (possibly empty), {:error, reason} if unreadable.
+  # The unreadable/empty distinction matters for denylist fail-closed (Task 4): an unreadable
+  # blocklist must NOT be treated as "nothing blocked".
+  defp load_hostset(path) do
     case File.read(path) do
       {:ok, body} ->
         set =
@@ -441,13 +481,17 @@ defmodule Genswarms.Browser do
           |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
           |> Enum.map(&String.downcase/1)
           |> MapSet.new()
-        if MapSet.size(set) == 0,
-          do: Logger.error("browse: allowlist #{path} is EMPTY — fail-closed, nothing will be fetched"),
-          else: Logger.info("browse: allowlist loaded from #{path} (#{MapSet.size(set)} hosts): #{Enum.join(Enum.sort(set), ", ")}")
-        set
+        {:ok, set}
+
       {:error, r} ->
-        Logger.error("browse: allowlist #{path} unreadable (#{inspect(r)}) — fail-closed, nothing will be fetched")
-        MapSet.new()
+        {:error, r}
+    end
+  end
+
+  defp host_of(url) do
+    case URI.parse(url) do
+      %URI{host: h} when is_binary(h) -> String.downcase(String.trim_trailing(h, "."))
+      _ -> nil
     end
   end
 
