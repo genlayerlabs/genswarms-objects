@@ -6,8 +6,9 @@ defmodule Genswarms.Tips do
   by a configurable slot template: `rotate: true` slots are seen-tracked and
   never repeat within a pool cycle; `rotate: false` slots are weighted random
   dressing. `draw` is a seeded PURE read (same recipient+date => same message —
-  crash-safe retries); `commit` records delivery and handles exhaustion
-  reshuffle. Content lifecycle: `add_fragments` lands `"pending"`,
+  crash-safe retries) and echoes `recipient_id` and `date` in the reply;
+  `commit` records delivery, handles exhaustion reshuffle, and echoes `recipient_id`.
+  Content lifecycle: `add_fragments` lands `"pending"`,
   `promote` -> `"live"` (the only drawable status), `retire` -> `"retired"`
   (never deleted; a retired id stays in seen-state).
 
@@ -60,11 +61,11 @@ defmodule Genswarms.Tips do
     %{
       draw: %{
         input: ~s({"action":"draw","recipient_id":"tg:1:0","date":"2026-07-03"}),
-        output: ~s({"ok":true,"text":"...","fragment_ids":["a1b2..."]})
+        output: ~s({"ok":true,"text":"...","fragment_ids":["a1b2..."],"recipient_id":"tg:1:0","date":"2026-07-03"})
       },
       commit: %{
         input: ~s({"action":"commit","recipient_id":"tg:1:0","fragment_ids":["a1b2..."]}),
-        output: ~s({"ok":true,"reshuffled":false})
+        output: ~s({"ok":true,"reshuffled":false,"recipient_id":"tg:1:0"})
       },
       add_fragments: %{
         input:
@@ -86,10 +87,10 @@ defmodule Genswarms.Tips do
       when is_binary(r) and is_binary(d) ->
         case Core.draw(state.fragments, state.seen, state.template, r, d, state.salt, state.guard) do
           {:ok, %{text: text, rotating_ids: ids}} ->
-            {:reply, Jason.encode!(%{ok: true, text: text, fragment_ids: ids}), state}
+            {:reply, Jason.encode!(%{ok: true, text: text, fragment_ids: ids, recipient_id: r, date: d}), state}
 
           {:error, :empty_pool} ->
-            {:reply, Jason.encode!(%{ok: false, error: "empty_pool"}), state}
+            {:reply, Jason.encode!(%{ok: false, error: "empty_pool", recipient_id: r}), state}
         end
 
       {:ok, %{"action" => "commit", "recipient_id" => r, "fragment_ids" => ids}}
@@ -103,7 +104,7 @@ defmodule Genswarms.Tips do
           do: store_call(state.store, :replace_seen, [r, seen_list]),
           else: store_call(state.store, :add_seen, [r, ids])
 
-        {:reply, Jason.encode!(%{ok: true, reshuffled: reshuffled}), state}
+        {:reply, Jason.encode!(%{ok: true, reshuffled: reshuffled, recipient_id: r}), state}
 
       {:ok, %{"action" => "add_fragments", "fragments" => frags}} when is_list(frags) ->
         add_fragments(frags, state)

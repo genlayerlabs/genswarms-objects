@@ -175,6 +175,8 @@ defmodule TipsObjectDrawCommitTest do
     {r2, state} = send!(state, msg)
     assert r1 == r2
     assert r1["ok"] == true
+    assert r1["recipient_id"] == "tg:9:0"
+    assert r1["date"] == "2026-07-03"
     assert [body_id] = r1["fragment_ids"]
     assert String.contains?(r1["text"], "Tip ")
     # pure read: nothing persisted yet
@@ -183,7 +185,7 @@ defmodule TipsObjectDrawCommitTest do
     {rc, state} = send!(state, %{
       "action" => "commit", "recipient_id" => "tg:9:0", "fragment_ids" => [body_id]
     })
-    assert rc == %{"ok" => true, "reshuffled" => false}
+    assert rc == %{"ok" => true, "reshuffled" => false, "recipient_id" => "tg:9:0"}
     assert {:add_seen, "tg:9:0", [^body_id]} =
              Enum.find(FakeTipsStore.calls(), &match?({:add_seen, _, _}, &1))
 
@@ -219,7 +221,7 @@ defmodule TipsObjectDrawCommitTest do
     # no live bodies at all -> empty_pool error reply
     {:ok, bare} = Tips.init(%{})
     {r, _} = send!(bare, %{"action" => "draw", "recipient_id" => "r", "date" => "2026-07-03"})
-    assert r == %{"ok" => false, "error" => "empty_pool"}
+    assert r == %{"ok" => false, "error" => "empty_pool", "recipient_id" => "r"}
   end
 
   test "init loads seen state from the store — rotation survives a restart" do
