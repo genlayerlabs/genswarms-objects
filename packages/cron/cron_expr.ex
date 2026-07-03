@@ -5,6 +5,14 @@ defmodule Genswarms.Cron.CronExpr do
   `minute hour day-of-month month day-of-week`; `*`, lists, ranges, `*/step`;
   DOW 0 and 7 are both Sunday; when BOTH DOM and DOW are restricted the day
   match is their OR (the POSIX quirk).
+
+  **`N/step` on a non-`*` base is NOT "N once, then nothing else"** — it is
+  vixie's range-step form anchored at `N` through the field's max, same as
+  `*/step` but starting from `N` instead of the field's lower bound. `"5/15
+  * * * *"` matches minutes `5, 20, 35, 50` (not just `5`); `"*/15 * * * *"`
+  matches `0, 15, 30, 45`. A literal single value with a step is a likely
+  typo for a plain `A-B/step` range or a bare `N` — the parser accepts it
+  either way (see `part/3`/`expand/4`), it does not error.
   """
 
   def parse(text) when is_binary(text) do
@@ -47,10 +55,6 @@ defmodule Genswarms.Cron.CronExpr do
         {:error, r} -> {:halt, {:error, r}}
       end
     end)
-    |> case do
-      {:ok, []} -> {:error, "empty cron field"}
-      other -> other
-    end
   end
 
   defp part(p, lo, hi) do
@@ -84,7 +88,8 @@ defmodule Genswarms.Cron.CronExpr do
       MapSet.member?(expr.months, dt.month) and day_match?(expr, dt)
   end
 
-  @search_days 1830  # ~5 years; an expression with no match in this window is unsatisfiable
+  # inclusive 0..1830 scan: 1831 days, roughly 5 years
+  @search_days 1830
 
   @doc "Smallest match strictly greater than from_ms, or :none within the search bound."
   def next(expr, from_ms) when is_integer(from_ms) do
@@ -98,7 +103,9 @@ defmodule Genswarms.Cron.CronExpr do
         floor_tod = if d == 0, do: start.hour * 60 + start.minute, else: 0
 
         case Enum.find(expr.tod, &(&1 >= floor_tod)) do
-          nil -> {:cont, :none}
+          nil ->
+            {:cont, :none}
+
           tod ->
             {:ok, dt} = DateTime.new(date, Time.new!(div(tod, 60), rem(tod, 60), 0), "Etc/UTC")
             {:halt, {:ok, DateTime.to_unix(dt, :millisecond)}}

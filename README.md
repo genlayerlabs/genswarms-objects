@@ -34,7 +34,11 @@ the duplication these repos carried before the registry existed.
 ## Store contracts
 
 - **cron**: `load_cron_jobs(states)`, `max_cron_job_id()`, `save_cron_job(job)`,
-  `save_cron_run(job, result)`.
+  `save_cron_run(job, result)` — see the "Store seam contract" section in
+  `.claude/skills/genswarms-cron-use/SKILL.md` for the load-bearing arg/return
+  shapes (atom-keyed rows, the JSON round-trip, the never-raise requirement);
+  `Genswarms.Cron.Store` (packages/cron/store.ex) mirrors it as an optional
+  `@behaviour` for compiler drift-checking.
 - **metrics**: `add_metrics(pending_map)`, `today_metrics()`.
 - **tips**: `load_fragments()`, `load_seen()`, `save_fragment(fragment)`,
   `save_fragment_status(id, status)`, `add_seen(recipient_id, ids)`,
@@ -54,5 +58,11 @@ mix deps.get
 
 One mix dep gives all four (`{:genswarms_objects, github: "genlayerlabs/genswarms-objects", tag: "vX.Y.Z"}`);
 each is notarized independently in swarmidx (`swarmidx:genlayerlabs/cron@…`, `…/browse@…`,
-`…/metrics@…`, `…/tips@…`) with the dirhash covering exactly its `packages/<name>` dir. Lockstep
-versioning: one tag versions the four (design doc §8).
+`…/metrics@…`, `…/tips@…`) with the dirhash covering exactly its `packages/<name>` dir
+(NOT the repo-level `checks/` tests). One repo tag ships all four directories
+in lockstep — but the four **package versions** advance independently: a repo
+tag that only touched `cron` still gets published as a new `cron@X.Y.Z` with
+`browse`/`metrics`/`tips` republished unchanged at their prior version. There
+is no in-repo file mapping package version → repo tag; see CHANGELOG.md for
+the reconstructed history (design doc §8 is the versioning policy, not a
+version ledger).

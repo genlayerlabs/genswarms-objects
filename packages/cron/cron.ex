@@ -12,11 +12,13 @@ defmodule Genswarms.Cron do
 
   alias Genswarms.Objects.ObjectServer
   alias Genswarms.Cron.Schedule
+  alias Genswarms.Cron.Job
   # Events seam: optional events_mod (exports object/4, e.g. a LogStore wrapper);
   # absent -> Logger. Injected via config, resolved in init.
 
   @terminal_states ~w(done deleted failed)
   @load_states ~w(active paused running)
+  @default_max_message_bytes 65_536
 
   def init(config) do
     store_mod = module_ref(Map.get(config, :store_mod))
@@ -26,15 +28,15 @@ defmodule Genswarms.Cron do
     jobs =
       store_call(store_mod, :load_cron_jobs, [@load_states], [])
       |> Enum.map(&normalize_loaded_job/1)
-      |> Enum.map(&recover_running_job(&1, now))
-      |> Enum.map(&apply_load_misfire(&1, now))
+      |> Enum.map(&Job.recover(&1, now))
+      |> Enum.map(&Job.apply_load_misfire(&1, now))
       |> Map.new(fn job -> {job.id, job} end)
+
+    max_store_id = to_id(store_call(store_mod, :max_cron_job_id, [], 0)) || 0
 
     state = %{
       name: Map.get(config, :name, :cron),
       swarm_name: Map.get(config, :swarm_name, "swarm"),
-      sender: Map.get(config, :sender, :sender),
-      runtime: Map.get(config, :runtime, nil),
       store_mod: store_mod,
       events_mod: module_ref(Map.get(config, :events_mod)),
       now_fn: now_fn,
@@ -51,17 +53,17 @@ defmodule Genswarms.Cron do
       max_attempts: Map.get(config, :max_attempts, 3),
       retry_backoff_ms: Map.get(config, :retry_backoff_ms, 60_000),
       async?: Map.get(config, :async?, true),
+      max_message_bytes: Map.get(config, :max_message_bytes, @default_max_message_bytes),
       min_period_ms: Map.get(config, :min_period_ms, 60_000),
       breaker_threshold: Map.get(config, :breaker_threshold, 5),
       jobs: jobs,
       tasks: %{},
-      next_id: max(store_call(store_mod, :max_cron_job_id, [], 0) + 1, next_memory_id(jobs)),
+      next_id: max(max_store_id + 1, next_memory_id(jobs)),
       # Fail-closed defaults: with no configured allowlists NOBODY can create
       # jobs and NO target is deliverable — the host declares both (pure data).
       trusted_sources:
         MapSet.new(Map.get(config, :trusted_sources, []) |> Enum.map(&to_string/1)),
-      allowed_targets:
-        normalize_allowed_targets(Map.get(config, :allowed_targets, %{}))
+      allowed_targets: normalize_allowed_targets(Map.get(config, :allowed_targets, %{}))
     }
 
     if map_size(jobs) > 0 do
@@ -77,15 +79,49 @@ defmodule Genswarms.Cron do
     %{
       create_job: %{
         input:
-          ~s({"action":"create_job","run_at":"2026-06-09T08:00:00Z","target":"telegram_conversation_runtime","message":{"action":"scheduled_turn","conversation_id":"tg:1:0","prompt":"Summarize active markets"}}),
+          ~s({"action":"create_job","schedule":{"every_ms":300000},"target":"reporter","message":{"action":"run"},"dedupe_key":"reporter:run"}),
         output: ~s({"ok":true,"job_id":1,"next_run_at":1780982400000})
       },
-      tick: %{input: ~s({"action":"tick"}), output: ~s({"ok":true,"launched":1})}
+      pause: %{
+        input: ~s({"action":"pause","job_id":1}),
+        output: ~s({"ok":true,"job_id":1,"state":"paused"})
+      },
+      resume: %{
+        input: ~s({"action":"resume","job_id":1}),
+        output: ~s({"ok":true,"job_id":1,"state":"active"})
+      },
+      delete: %{
+        input: ~s({"action":"delete","job_id":1}),
+        output: ~s({"ok":true,"job_id":1,"state":"deleted"})
+      },
+      tick: %{input: ~s({"action":"tick"}), output: ~s({"ok":true,"launched":1})},
+      list: %{
+        input: ~s({"action":"list","include_paused":true}),
+        output: ~s({"ok":true,"jobs":[{"id":1,"target":"reporter","action":"run"}]})
+      },
+      status: %{
+        input: ~s({"action":"status"}),
+        output: ~s({"ok":true,"jobs":1,"running":0,"max_concurrency":16,"max_attempts":3})
+      },
+      run_now: %{
+        input: ~s({"action":"run_now","job_id":1}),
+        output: ~s({"ok":true,"job_id":1,"launched":1})
+      }
     }
   end
 
   def handle_message(from, content, state) do
-    case Jason.decode(content) do
+    if oversized_message?(content, state) do
+      if trusted?(from, state),
+        do: {:reply, Jason.encode!(%{ok: false, error: "message_too_large"}), state},
+        else: {:noreply, state}
+    else
+      handle_decoded_message(from, Jason.decode(content), state)
+    end
+  end
+
+  defp handle_decoded_message(from, decoded, state) do
+    case decoded do
       {:ok, %{"action" => "create_job"} = msg} ->
         if trusted?(from, state), do: create_job(from, msg, state), else: {:noreply, state}
 
@@ -100,6 +136,9 @@ defmodule Genswarms.Cron do
 
       {:ok, %{"action" => "tick"}} ->
         if trusted?(from, state), do: run_due(state), else: {:noreply, state}
+
+      {:ok, %{"action" => "run_now", "job_id" => id}} ->
+        if trusted?(from, state), do: run_now_job(id, state), else: {:noreply, state}
 
       {:ok, %{"action" => "list"} = msg} ->
         if trusted?(from, state), do: list_jobs(msg, state), else: {:noreply, state}
@@ -118,12 +157,20 @@ defmodule Genswarms.Cron do
           {:noreply, state}
         end
 
+      {:ok, _decoded} ->
+        if trusted?(from, state),
+          do: {:reply, Jason.encode!(%{ok: false, error: "unknown_action"}), state},
+          else: {:noreply, state}
+
       _ ->
         {:noreply, state}
     end
   end
 
-  def handle_info(:tick, state), do: run_due(state)
+  def handle_info(:tick, state) do
+    {_reply, state} = run_due_core(state)
+    {:noreply, state}
+  end
 
   def handle_info({ref, {:cron_run_result, job_id, result}}, state) do
     Process.demonitor(ref, [:flush])
@@ -163,33 +210,38 @@ defmodule Genswarms.Cron do
     # both to_string message-derived fields, and a crafted map/list value
     # would raise Protocol.UndefinedError on the engine's rescue-less cast
     # path (ObjectServer crash). Reject, never coerce.
+    #
+    # F3: schedule normalization/floor and target/payload validation must
+    # also run BEFORE the once-terminal-dedupe lookup — otherwise a garbage
+    # schedule or a disallowed target on a once:true re-create with a
+    # terminal dedupe_key would short-circuit straight to {ok:true,
+    # deduped:true} instead of being rejected. Only the past-guard
+    # (check_not_past, in create_live_job) stays AFTER the dedupe lookup —
+    # skipped entirely on a dedupe hit, because a once:true re-create with a
+    # now-past run_at must still no-op with deduped:true (load-bearing; see
+    # checks/cron_kinds_test.exs).
     with :ok <- validate_create_fields(msg),
          {:ok, norm} <- Schedule.normalize(due_value(msg), now),
          :ok <- check_floor(norm, state),
-         :ok <- check_not_past(norm, now, state) do
+         {:ok, _payload} <- normalize_payload(msg, state) do
+      case once_terminal_dedupe_row(state, msg) do
+        nil ->
+          create_live_job(from, msg, norm, state, now)
+
+        row ->
+          {:reply, Jason.encode!(terminal_dedupe_reply(row)), arm_timer(state, now)}
+      end
+    else
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
+    end
+  end
+
+  defp create_live_job(from, msg, norm, state, now) do
+    with :ok <- check_not_past(norm, now, state) do
       case existing_dedupe_job(state, msg["dedupe_key"]) do
         nil ->
-          case build_job(from, msg, norm, state, now) do
-            {:ok, job} ->
-              state =
-                %{
-                  state
-                  | jobs: Map.put(state.jobs, job.id, job),
-                    next_id: max(state.next_id, job.id + 1)
-                }
-                |> persist_job(job)
-
-              {:reply,
-               Jason.encode!(%{
-                 ok: true,
-                 job_id: job.id,
-                 state: job.state,
-                 next_run_at: job.next_run_at
-               }), arm_timer(state, now)}
-
-            {:error, reason} ->
-              {:reply, Jason.encode!(%{ok: false, error: reason}), state}
-          end
+          insert_created_job(from, msg, norm, state, now)
 
         job ->
           {:reply,
@@ -202,6 +254,30 @@ defmodule Genswarms.Cron do
            }), arm_timer(state, now)}
       end
     else
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
+    end
+  end
+
+  defp insert_created_job(from, msg, norm, state, now) do
+    case build_job(from, msg, norm, state, now) do
+      {:ok, job} ->
+        state =
+          %{
+            state
+            | jobs: Map.put(state.jobs, job.id, job),
+              next_id: max(state.next_id, job.id + 1)
+          }
+          |> persist_job(job)
+
+        {:reply,
+         Jason.encode!(%{
+           ok: true,
+           job_id: job.id,
+           state: job.state,
+           next_run_at: job.next_run_at
+         }), arm_timer(state, now)}
+
       {:error, reason} ->
         {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
@@ -231,6 +307,9 @@ defmodule Genswarms.Cron do
       not string_or_nil?(msg["misfire"]) ->
         {:error, "misfire must be a string"}
 
+      not (is_nil(msg["once"]) or is_boolean(msg["once"])) ->
+        {:error, "once must be a boolean"}
+
       true ->
         :ok
     end
@@ -250,6 +329,30 @@ defmodule Genswarms.Cron do
     |> Enum.find(fn job ->
       job.dedupe_key == dedupe_key and job.state not in @terminal_states
     end)
+  end
+
+  defp once_terminal_dedupe_row(state, %{"once" => true, "dedupe_key" => dk})
+       when is_binary(dk) and dk != "" do
+    key = safe_optional(dk, 200)
+
+    state.store_mod
+    |> store_call(:load_cron_jobs, [@terminal_states], [])
+    |> Enum.find(&(terminal_dedupe_key(&1) == key))
+  end
+
+  defp once_terminal_dedupe_row(_state, _msg), do: nil
+
+  defp terminal_dedupe_reply(row) do
+    row_id = row_value(row, :id)
+
+    %{
+      ok: true,
+      job_id: to_id(row_id) || row_id,
+      state: row_value(row, :state),
+      deduped: true
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 
   defp build_job(from, msg, norm, state, now) do
@@ -277,7 +380,6 @@ defmodule Genswarms.Cron do
          breaker_threshold: positive_int(msg["breaker_threshold"], state.breaker_threshold),
          origin: normalize_origin(msg["origin"], from),
          payload: payload,
-         context_from: normalize_context_from(msg["context_from"]),
          dedupe_key: safe_optional(msg["dedupe_key"], 200),
          created_by: to_string(from),
          created_at: now,
@@ -312,7 +414,12 @@ defmodule Genswarms.Cron do
   defp terminal_dedupe_key(%{data: %{"dedupe_key" => dk}}) when is_binary(dk) and dk != "",
     do: dk
 
-  defp terminal_dedupe_key(_row), do: nil
+  defp terminal_dedupe_key(row) do
+    case row_value(row, :data) do
+      %{"dedupe_key" => dk} when is_binary(dk) and dk != "" -> dk
+      _ -> nil
+    end
+  end
 
   defp apply_seed(state, seed, now, terminal_keys) do
     dk = seed[:dedupe_key] || seed["dedupe_key"]
@@ -464,6 +571,11 @@ defmodule Genswarms.Cron do
     do: msg["run_at"] || msg["at"] || msg["next_run_at"] || msg["schedule"]
 
   defp run_due(state) do
+    {reply, state} = run_due_core(state)
+    {:reply, Jason.encode!(reply), state}
+  end
+
+  defp run_due_core(state) do
     now = state.now_fn.()
     state = disarm_timer(state)
     capacity = max(state.max_concurrency - map_size(state.tasks), 0)
@@ -482,13 +594,12 @@ defmodule Genswarms.Cron do
 
     state = arm_timer(state, now)
 
-    {:reply,
-     Jason.encode!(%{
+    {%{
        ok: true,
        launched: length(due),
        deferred: length(rest),
        running: map_size(state.tasks)
-     }), state}
+     }, state}
   end
 
   defp due?(%{state: "active", next_run_at: next_run_at, id: id}, now)
@@ -498,10 +609,56 @@ defmodule Genswarms.Cron do
 
   defp due?(_job, _now), do: false
 
-  defp launch_job(job, state, now) do
-    {claimed, state} = claim_job(job, state, now)
+  defp run_now_job(raw_id, state) do
+    case job_id(raw_id) do
+      {:ok, id} ->
+        run_now_existing_job(id, Map.get(state.jobs, id), state)
+
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
+    end
+  end
+
+  defp run_now_existing_job(id, nil, state),
+    do: {:reply, Jason.encode!(%{ok: false, error: "job not found", job_id: id}), state}
+
+  defp run_now_existing_job(id, %{state: state_name}, state) when state_name in @terminal_states,
+    do:
+      {:reply, Jason.encode!(%{ok: false, error: "job terminal", job_id: id, state: state_name}),
+       state}
+
+  # F2: run_now bypassing max_concurrency would let a trusted caller launch
+  # unbounded concurrent tasks regardless of the configured cap. At
+  # saturation, reject rather than defer — run_now is an immediate-fire
+  # request, not a schedulable one; there is no due-queue to defer it onto.
+  defp run_now_existing_job(id, %{state: "active"} = job, state) do
+    if map_size(state.tasks) >= state.max_concurrency do
+      {:reply, Jason.encode!(%{ok: false, error: "at max concurrency", job_id: id}), state}
+    else
+      now = state.now_fn.()
+      state = launch_job(job, state, now, now) |> arm_timer(now)
+
+      {:reply,
+       Jason.encode!(%{
+         ok: true,
+         job_id: id,
+         launched: 1,
+         running: map_size(state.tasks)
+       }), state}
+    end
+  end
+
+  defp run_now_existing_job(id, %{state: state_name}, state),
+    do:
+      {:reply,
+       Jason.encode!(%{ok: false, error: "job not active", job_id: id, state: state_name}), state}
+
+  defp launch_job(job, state, now, occurrence_due \\ nil) do
+    {claimed, state} = claim_job(job, state, now, occurrence_due)
 
     if state.async? do
+      Process.flag(:trap_exit, true)
+
       task =
         Task.async(fn ->
           {:cron_run_result, claimed.id, safe_run(claimed, state)}
@@ -513,21 +670,14 @@ defmodule Genswarms.Cron do
     end
   end
 
-  defp claim_job(job, state, now) do
-    job = %{
-      job
-      | last_run_at: now,
-        next_run_at: nil,
-        # A retry claim's next_run_at is the backoff timestamp, not the occurrence's
-        # true due point — keep the original due (set at the first claim of this
-        # occurrence) alive across retry cycles so a later success re-arms off the
-        # grid, not off the backoff time. Cleared on success/exhaustion (complete_job).
-        claimed_due: job.claimed_due || job.next_run_at,
-        state: "running",
-        attempts: Map.get(job, :attempts, 0) + 1,
-        updated_at: now
-    }
+  defp claim_job(job, state, now, nil) do
+    job = Job.claim(job, now)
+    state = persist_job(%{state | jobs: Map.put(state.jobs, job.id, job)}, job)
+    {job, state}
+  end
 
+  defp claim_job(job, state, now, occurrence_due) do
+    job = Job.claim(job, now, occurrence_due)
     state = persist_job(%{state | jobs: Map.put(state.jobs, job.id, job)}, job)
     {job, state}
   end
@@ -576,19 +726,8 @@ defmodule Genswarms.Cron do
         # survive the task result: record the outcome, clear the claim, but do
         # NOT rebuild the job "active"/re-arm it (delete already survives — a
         # terminal job is removed from the map, so the nil clause above hits).
-        job =
-          if job.state == "paused" do
-            %{
-              job
-              | claimed_due: nil,
-                attempts: 0,
-                last_status: result.status,
-                last_error: result.error,
-                updated_at: now
-            }
-          else
-            complete_job(job, result, now)
-          end
+        # Job.finish/3 owns that pause-preserve branch (see job.ex).
+        job = Job.finish(job, result, now)
 
         store_call(state.store_mod, :save_cron_run, [job, result], :ok)
 
@@ -603,6 +742,7 @@ defmodule Genswarms.Cron do
           swarm: state.swarm_name,
           metadata: %{
             job_id: job_id,
+            name: job.name,
             target: job.payload["target"],
             status: result.status,
             state: job.state,
@@ -610,206 +750,94 @@ defmodule Genswarms.Cron do
           }
         )
 
+        if result.status != "ok" do
+          emit_event(state, :job_run_failed, "Scheduled job run failed",
+            swarm: state.swarm_name,
+            metadata: %{
+              job_id: job_id,
+              name: job.name,
+              target: job.payload["target"],
+              error: result.error,
+              state: job.state,
+              attempts: job.attempts,
+              consecutive_failures: job.consecutive_failures
+            }
+          )
+        end
+
+        if result.status != "ok" and job.state == "paused" and job.paused_by == "breaker" do
+          emit_event(state, :job_breaker_paused, "Scheduled job paused by breaker",
+            swarm: state.swarm_name,
+            metadata: %{
+              job_id: job_id,
+              name: job.name,
+              consecutive_failures: job.consecutive_failures
+            }
+          )
+        end
+
         arm_timer(state, now)
     end
   end
 
-  defp complete_job(job, %{status: "ok"} = result, now) do
-    if Schedule.recurring?(job.schedule) do
-      case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
-        {:ok, next} ->
-          %{
-            job
-            | state: "active",
-              next_run_at: next,
-              claimed_due: nil,
-              attempts: 0,
-              consecutive_failures: 0,
-              last_status: result.status,
-              last_error: nil,
-              updated_at: now
-          }
-
-        no_next ->
-          # :none or {:error, reason} (poisoned stored expr): no next
-          # occurrence exists — terminal done, the schedule reason (if any)
-          # kept visible in last_error.
-          %{
-            job
-            | state: "done",
-              next_run_at: nil,
-              claimed_due: nil,
-              last_status: result.status,
-              last_error: schedule_error(no_next),
-              updated_at: now
-          }
-      end
-    else
-      %{
-        job
-        | state: "done",
-          next_run_at: nil,
-          claimed_due: nil,
-          last_status: result.status,
-          last_error: nil,
-          updated_at: now
-      }
-    end
-  end
-
-  defp complete_job(job, result, now) do
-    if job.attempts < job.max_attempts do
-      %{
-        job
-        | state: "active",
-          next_run_at: now + retry_delay(job, job.attempts),
-          last_status: result.status,
-          last_error: result.error,
-          updated_at: now
-      }
-    else
-      exhausted(job, result, now)
-    end
-  end
-
-  # Occurrence-scoped exhaustion (attempts hit max_attempts with no success).
-  # Recurring: bump consecutive_failures; the breaker (>= breaker_threshold) pauses
-  # the job (paused_by "breaker") instead of re-arming it. Below the breaker, the
-  # occurrence still moves on to the next grid point (Schedule.next_after from the
-  # ORIGINAL claimed_due, not `now` — the retry-grid fix in claim_job keeps that due
-  # point stable across the whole retry cycle). One-shot: terminal "failed" (0.1.1).
-  defp exhausted(job, result, now) do
-    if Schedule.recurring?(job.schedule) do
-      cf = (job.consecutive_failures || 0) + 1
-
-      base = %{
-        job
-        | attempts: 0,
-          consecutive_failures: cf,
-          claimed_due: nil,
-          last_status: result.status,
-          last_error: result.error,
-          updated_at: now
-      }
-
-      if cf >= job.breaker_threshold do
-        %{base | state: "paused", paused_by: "breaker", next_run_at: nil}
-      else
-        case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
-          {:ok, next} ->
-            %{base | state: "active", next_run_at: next}
-
-          # :none or {:error, _}: no next occurrence — terminal failed; base
-          # already carries the (more proximate) delivery error in last_error.
-          _no_next ->
-            %{base | state: "failed", next_run_at: nil}
-        end
-      end
-    else
-      %{
-        job
-        | state: "failed",
-          next_run_at: nil,
-          claimed_due: nil,
-          last_status: result.status,
-          last_error: result.error,
-          updated_at: now
-      }
-    end
-  end
-
-  # Schedule.next_after on a corrupt/poisoned stored schedule returns
-  # {:error, reason}; call sites treat it exactly like :none (no next
-  # occurrence). Where a job map is in hand this keeps the reason visible.
-  defp schedule_error(:none), do: nil
-  defp schedule_error({:error, reason}), do: "schedule error: #{reason}"
-
-  defp retry_delay(job, attempts) do
-    base = max(Map.get(job, :retry_backoff_ms, 60_000), 0)
-    min(base * max(attempts, 1), 15 * 60_000)
-  end
-
   defp set_job_state(id, new_state, state) do
-    id = to_id(id)
+    case job_id(id) do
+      {:ok, id} ->
+        case Map.get(state.jobs, id) do
+          nil ->
+            {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
 
-    case Map.get(state.jobs, id) do
-      nil ->
-        {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
+          job ->
+            job = %{job | state: new_state, updated_at: state.now_fn.()}
 
-      job ->
-        job = %{job | state: new_state, updated_at: state.now_fn.()}
+            jobs =
+              if new_state in @terminal_states,
+                do: Map.delete(state.jobs, id),
+                else: Map.put(state.jobs, id, job)
 
-        jobs =
-          if new_state in @terminal_states,
-            do: Map.delete(state.jobs, id),
-            else: Map.put(state.jobs, id, job)
+            state = persist_job(%{state | jobs: jobs}, job)
 
-        state = persist_job(%{state | jobs: jobs}, job)
+            {:reply, Jason.encode!(%{ok: true, job_id: id, state: new_state}),
+             arm_timer(state, state.now_fn.())}
+        end
 
-        {:reply, Jason.encode!(%{ok: true, job_id: id, state: new_state}),
-         arm_timer(state, state.now_fn.())}
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
   end
 
   defp resume_job(id, state) do
-    id = to_id(id)
+    case job_id(id) do
+      {:ok, id} ->
+        resume_existing_job(id, Map.get(state.jobs, id), state)
 
-    case Map.get(state.jobs, id) do
-      nil ->
-        {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
-
-      # Resume only acts on paused jobs. Resuming a RUNNING job used to
-      # double-fire it (running has next_run_at nil -> apply_resume_misfire
-      # read that as a missed occurrence and coalesce-armed `now` while the
-      # first occurrence was still in flight); resuming an ACTIVE job is
-      # meaningless. Contract: ok:false "job not paused" + the current state.
-      %{state: other} = _job when other != "paused" ->
-        {:reply, Jason.encode!(%{ok: false, error: "job not paused", job_id: id, state: other}),
-         state}
-
-      job ->
-        now = state.now_fn.()
-
-        job =
-          %{job | state: "active", paused_by: nil, consecutive_failures: 0, updated_at: now}
-          |> apply_resume_misfire(now)
-
-        if job.next_run_at do
-          state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
-
-          {:reply, Jason.encode!(%{ok: true, job_id: id, state: "active"}), arm_timer(state, now)}
-        else
-          {:reply, Jason.encode!(%{ok: false, error: "job has no future run_at"}), state}
-        end
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
   end
 
-  # Every resume clears the breaker (paused_by/consecutive_failures). For recurring
-  # jobs whose due point was missed (next_run_at nil — e.g. breaker-paused — or now
-  # in the past because the pause spanned occurrences), apply the job's misfire
-  # policy: "skip" jumps to the next FUTURE grid point (no catch-up delivery);
-  # otherwise ("coalesce") fires once, immediately. A recurring job whose next_run_at
-  # is still in the future is left alone (resuming early shouldn't fire it early).
-  # One-shot jobs with a nil next_run_at keep 0.1.1 behavior (untouched -> the
-  # caller's "job has no future run_at" reply).
-  defp apply_resume_misfire(job, now) do
-    missed? = is_nil(job.next_run_at) or job.next_run_at <= now
+  defp resume_existing_job(_id, nil, state),
+    do: {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
 
-    if missed? and Schedule.recurring?(job.schedule) do
-      case job.misfire do
-        "skip" ->
-          case Schedule.next_after(job.schedule, job.last_run_at || job.created_at, now) do
-            {:ok, next} -> %{job | next_run_at: next}
-            # :none or {:error, _}: nothing to arm — the caller's
-            # "job has no future run_at" reply surfaces it.
-            _no_next -> %{job | next_run_at: nil}
-          end
+  # Resume only acts on paused jobs. Resuming a RUNNING job used to double-fire it
+  # (running has next_run_at nil -> Job.resume's misfire pass read that as missed
+  # and coalesce-armed `now` while the first occurrence was still in flight);
+  # resuming an ACTIVE job is meaningless.
+  defp resume_existing_job(id, %{state: other}, state) when other != "paused" do
+    {:reply, Jason.encode!(%{ok: false, error: "job not paused", job_id: id, state: other}),
+     state}
+  end
 
-        _coalesce ->
-          %{job | next_run_at: now}
-      end
+  defp resume_existing_job(id, job, state) do
+    now = state.now_fn.()
+    job = Job.resume(job, now)
+
+    if job.next_run_at do
+      state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
+
+      {:reply, Jason.encode!(%{ok: true, job_id: id, state: "active"}), arm_timer(state, now)}
     else
-      job
+      {:reply, Jason.encode!(%{ok: false, error: "job has no future run_at"}), state}
     end
   end
 
@@ -834,6 +862,8 @@ defmodule Genswarms.Cron do
       action: get_in(job.payload, ["message", "action"]),
       state: job.state,
       kind: job.schedule["kind"],
+      schedule: job.schedule,
+      dedupe_key: job.dedupe_key,
       next_run_at: job.next_run_at,
       last_run_at: job.last_run_at,
       last_status: job.last_status,
@@ -859,9 +889,15 @@ defmodule Genswarms.Cron do
       |> Enum.map(& &1.next_run_at)
 
     delay =
-      case active_due do
-        [] -> state.tick_ms
-        times -> max(Enum.min(times) - now, 0)
+      cond do
+        map_size(state.tasks) >= state.max_concurrency ->
+          state.tick_ms
+
+        active_due == [] ->
+          state.tick_ms
+
+        true ->
+          max(Enum.min(active_due) - now, 0)
       end
 
     %{state | timer_ref: Process.send_after(self(), :tick, min(delay, state.tick_ms))}
@@ -882,9 +918,7 @@ defmodule Genswarms.Cron do
 
   defp normalize_allowed_targets(targets) when is_map(targets) do
     Enum.reduce(targets, %{targets: %{}, actions: %{}}, fn {target, actions}, acc ->
-      target_atom =
-        if is_atom(target), do: target, else: String.to_existing_atom(to_string(target))
-
+      target_atom = allowed_target_atom(target)
       target_text = to_string(target_atom)
       action_set = MapSet.new(Enum.map(actions, &to_string/1))
 
@@ -895,6 +929,18 @@ defmodule Genswarms.Cron do
     end)
   end
 
+  defp allowed_target_atom(target) when is_atom(target), do: target
+
+  defp allowed_target_atom(target) do
+    text = to_string(target)
+    existing_target_atom(text)
+  end
+
+  defp existing_target_atom(text) do
+    String.to_existing_atom(text)
+  rescue
+    ArgumentError -> raise ArgumentError, "cron allowed_targets: unknown object :#{text}"
+  end
 
   defp default_deliver_fn(swarm_name) do
     fn target, from, content ->
@@ -904,6 +950,8 @@ defmodule Genswarms.Cron do
   end
 
   defp normalize_loaded_job(%{id: id, state: state, data: data}) do
+    id = to_id(id) || to_id(data["id"])
+
     atomized =
       data
       |> atomize_known()
@@ -933,7 +981,6 @@ defmodule Genswarms.Cron do
       claimed_due: nil,
       origin: data["origin"] || %{},
       payload: data["payload"] || %{},
-      context_from: data["context_from"] || [],
       dedupe_key: data["dedupe_key"],
       created_by: data["created_by"],
       created_at: data["created_at"],
@@ -949,81 +996,22 @@ defmodule Genswarms.Cron do
   defp upgrade_schedule(%{"run_at_ms" => ms}), do: %{"kind" => "run_at", "run_at_ms" => ms}
   defp upgrade_schedule(other), do: other
 
-  defp normalize_origin(origin, from) when is_map(origin),
-    do:
-      origin
-      |> Map.take(["conversation_id", "user_id", "chat_id", "thread_id", "source"])
-      |> Map.put_new("source", to_string(from))
+  defp normalize_origin(origin, from) when is_map(origin) do
+    origin
+    |> Enum.reduce(%{}, fn {key, value}, acc ->
+      if scalar?(value), do: Map.put(acc, to_string(key), value), else: acc
+    end)
+    |> Map.put_new("source", to_string(from))
+  end
 
   defp normalize_origin(_origin, from), do: %{"source" => to_string(from)}
 
-  defp normalize_context_from(list) when is_list(list),
-    do: list |> Enum.map(&to_id/1) |> Enum.filter(&is_integer/1) |> Enum.uniq()
+  defp scalar?(value)
+       when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or
+              is_nil(value),
+       do: true
 
-  defp normalize_context_from(_), do: []
-
-  # Boot-time recovery: any job found "running" (crashed mid-claim) is re-armed.
-  # One-shot: unchanged from 0.1.1 (fires again immediately). Recurring: apply the
-  # same misfire policy as a manual resume (coalesce -> now, skip -> the next future
-  # grid point) — atomize_known backfills :misfire ("coalesce" default) for every
-  # loaded job, including 0.1.1-era rows that never had the field.
-  defp recover_running_job(%{state: "running"} = job, now) do
-    schedule = Map.get(job, :schedule)
-
-    next_run_at =
-      if Schedule.recurring?(schedule) do
-        case job.misfire do
-          "skip" ->
-            case Schedule.next_after(schedule, job.last_run_at || job.created_at, now) do
-              {:ok, next} -> next
-              # :none or {:error, _} (poisoned stored expr): fall back to the
-              # coalesce recovery point instead of crashing init — the run's
-              # completion then parks the job terminal with the reason.
-              _no_next -> now
-            end
-
-          _coalesce ->
-            now
-        end
-      else
-        now
-      end
-
-    %{
-      job
-      | state: "active",
-        next_run_at: next_run_at,
-        last_status: "recovered",
-        last_error: "scheduler restarted while job was running",
-        updated_at: now
-    }
-  end
-
-  defp recover_running_job(job, _now), do: job
-
-  # Load-time misfire pass for ORDINARY downtime: an ACTIVE recurring job whose
-  # stored next_run_at is already past missed occurrences while the scheduler
-  # simply wasn't running (no crash mid-run — recover_running_job handles that).
-  # "skip" advances to the next FUTURE grid point (no catch-up delivery, same
-  # grid base as the missed due); "coalesce" (default) leaves the past due in
-  # place — exactly one catch-up, unchanged behavior. One-shots are untouched
-  # (a past one-shot still fires its catch-up). Runs after recover_running_job,
-  # which never leaves a strictly-past next_run_at, so the passes don't overlap.
-  defp apply_load_misfire(%{state: "active", misfire: "skip", next_run_at: due} = job, now)
-       when is_integer(due) and due < now do
-    if Schedule.recurring?(Map.get(job, :schedule)) do
-      case Schedule.next_after(job.schedule, due, now) do
-        {:ok, next} -> %{job | next_run_at: next, updated_at: now}
-        # :none or {:error, _}: nothing to arm — same shape as a skip resume.
-        # Record the schedule error to prevent silent-park; observable via last_error.
-        _no_next -> %{job | next_run_at: nil, last_error: "schedule error: no next occurrence at load", updated_at: now}
-      end
-    else
-      job
-    end
-  end
-
-  defp apply_load_misfire(job, _now), do: job
+  defp scalar?(_value), do: false
 
   defp positive_int(value, default) do
     case to_id(value) do
@@ -1051,22 +1039,38 @@ defmodule Genswarms.Cron do
   defp safe_optional(value, max), do: safe_text(value, max)
 
   defp next_memory_id(jobs) do
-    case Map.keys(jobs) do
+    case Enum.filter(Map.keys(jobs), &is_integer/1) do
       [] -> 1
       ids -> Enum.max(ids) + 1
     end
   end
 
-  defp to_id(id) when is_integer(id), do: id
+  defp job_id(id) do
+    case to_id(id) do
+      n when is_integer(n) and n > 0 -> {:ok, n}
+      _ -> {:error, "invalid job_id"}
+    end
+  end
+
+  defp to_id(id) when is_integer(id) and id >= 0, do: id
+  defp to_id(id) when is_integer(id), do: nil
 
   defp to_id(id) when is_binary(id) do
     case Integer.parse(id) do
-      {n, _} -> n
+      {n, ""} when n >= 0 -> n
       _ -> nil
     end
   end
 
   defp to_id(_), do: nil
+
+  defp oversized_message?(content, state) when is_binary(content),
+    do: byte_size(content) > state.max_message_bytes
+
+  defp oversized_message?(_content, _state), do: false
+
+  defp row_value(row, key) when is_map(row), do: Map.get(row, key) || Map.get(row, to_string(key))
+  defp row_value(_row, _key), do: nil
 
   # ── package seams ──────────────────────────────────────────────────────────
   # store_call/4: guarded durable-store call — a nil/partial store_mod degrades
@@ -1089,7 +1093,9 @@ defmodule Genswarms.Cron do
          function_exported?(ev, :object, 4) do
       ev.object(:cron, event_type, message, opts)
     else
-      Logger.info("[cron] #{event_type}: #{message} #{inspect(Keyword.get(opts, :metadata, %{}))}")
+      Logger.info(
+        "[cron] #{event_type}: #{message} #{inspect(Keyword.get(opts, :metadata, %{}))}"
+      )
     end
   end
 
