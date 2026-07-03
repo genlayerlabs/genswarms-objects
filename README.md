@@ -1,7 +1,7 @@
 # genswarms-objects
 
 Utility object handlers for [genswarms](https://github.com/genlayerlabs/genswarms)
-swarms — one lockstep monorepo, three swarmidx packages (`kind: handler`):
+swarms — one lockstep monorepo, four swarmidx packages (`kind: handler`):
 
 | Package | Object | What it does |
 |---|---|---|
@@ -13,7 +13,7 @@ swarms — one lockstep monorepo, three swarmidx packages (`kind: handler`):
 Extracted from wingston-rally-bot (browse, metrics) and micro-markets (cron) —
 the duplication these repos carried before the registry existed.
 
-## Conventions (all three)
+## Conventions (all four)
 
 - **Config is pure data.** Module refs (`store_mod`/`store`/`events_mod`) arrive
   as atoms (Elixir defs) or strings (JSON IR); strings resolve via
@@ -36,6 +36,10 @@ the duplication these repos carried before the registry existed.
 - **cron**: `load_cron_jobs(states)`, `max_cron_job_id()`, `save_cron_job(job)`,
   `save_cron_run(job, result)`.
 - **metrics**: `add_metrics(pending_map)`, `today_metrics()`.
+- **tips**: `load_fragments()`, `load_seen()`, `save_fragment(fragment)`,
+  `save_fragment_status(id, status)`, `add_seen(recipient_id, ids)`,
+  `replace_seen(recipient_id, keep_ids)` — all optional, memory-only without
+  a store.
 - **cron events** (optional `events_mod`): `object(:cron, event_type, message, opts)`
   — e.g. a LogStore wrapper; absent → Logger.
 
@@ -43,12 +47,12 @@ the duplication these repos carried before the registry existed.
 
 ```sh
 mix deps.get
-./checks/run.sh   # cron (mm suite), browse ×3 (wingston suites), metrics — no store, no network
+./checks/run.sh   # cron (mm suite), browse ×3 (wingston suites), metrics, tips — no store, no network
 ```
 
 ## Consuming
 
-One mix dep gives all three (`{:genswarms_objects, github: "genlayerlabs/genswarms-objects", tag: "vX.Y.Z"}`);
+One mix dep gives all four (`{:genswarms_objects, github: "genlayerlabs/genswarms-objects", tag: "vX.Y.Z"}`);
 each is notarized independently in swarmidx (`swarmidx:genlayerlabs/cron@…`, `…/browse@…`,
-`…/metrics@…`) with the dirhash covering exactly its `packages/<name>` dir. Lockstep
-versioning: one tag versions the three (design doc §8).
+`…/metrics@…`, `…/tips@…`) with the dirhash covering exactly its `packages/<name>` dir. Lockstep
+versioning: one tag versions the four (design doc §8).

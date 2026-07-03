@@ -73,3 +73,7 @@ send the text (your transport, your consent gates)
 - Pool of 1 rotating fragment: repeats are allowed (starvation beats silence).
 - `date` is a seed component, not parsed — pass a stable per-send day string;
   passing timestamps would defeat retry determinism.
+- Templates with MULTIPLE `rotate: true` slots share one union coverage
+  threshold for the exhaustion reshuffle, and two rotating slots of the same
+  kind can pick the same fragment twice in one draw — v0.1.3 is designed
+  around a single rotating slot.

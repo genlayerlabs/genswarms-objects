@@ -78,6 +78,14 @@ defmodule TipsObjectLifecycleTest do
     assert state.template == [%{kind: "nudge", rotate: true}]
     assert state.salt == "abc"
     assert state.guard == 3
+
+    # only literal true enables rotation — a string "true" normalizes to false
+    {:ok, s2} = Tips.init(%{template: [%{"kind" => "nudge", "rotate" => "true"}]})
+    assert s2.template == [%{kind: "nudge", rotate: false}]
+
+    # an invalid reshuffle_guard falls back to the default
+    {:ok, s3} = Tips.init(%{reshuffle_guard: "20"})
+    assert s3.guard == 20
   end
 end
 

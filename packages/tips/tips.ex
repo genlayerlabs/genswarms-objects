@@ -32,7 +32,6 @@ defmodule Genswarms.Tips do
       replace_seen(recipient_id, keep_ids) :: any  # reshuffle: delete the rest
   """
 
-  require Logger
   alias Genswarms.Tips.Core
 
   @default_template [
@@ -51,7 +50,7 @@ defmodule Genswarms.Tips do
        store: store,
        template: normalize_template(Map.get(config, :template)),
        salt: Map.get(config, :salt, @default_salt),
-       guard: Map.get(config, :reshuffle_guard, @default_guard),
+       guard: normalize_guard(Map.get(config, :reshuffle_guard, @default_guard)),
        fragments: load_fragments(store),
        seen: load_seen(store)
      }}
@@ -187,13 +186,16 @@ defmodule Genswarms.Tips do
   defp normalize_template(list) when is_list(list) do
     t =
       for e <- list, is_map(e), k = e[:kind] || e["kind"], is_binary(k) do
-        %{kind: k, rotate: e[:rotate] || e["rotate"] || false}
+        %{kind: k, rotate: (e[:rotate] || e["rotate"]) == true}
       end
 
     if t == [], do: @default_template, else: t
   end
 
   defp normalize_template(_), do: @default_template
+
+  defp normalize_guard(g) when is_integer(g) and g >= 0, do: g
+  defp normalize_guard(_), do: @default_guard
 
   defp load_fragments(store) do
     if store?(store, :load_fragments, 0), do: store.load_fragments(), else: []

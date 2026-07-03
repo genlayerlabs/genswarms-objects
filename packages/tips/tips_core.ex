@@ -44,8 +44,10 @@ defmodule Genswarms.Tips.Core do
       All seen but pool non-empty (live set shrank under a retire race) —
       fall back to avoiding only the most recent `guard` seen ids; commit/5
       does the durable reshuffle. Zero live fragments — `{:error, :empty_pool}`.
-    - `rotate: false` — weighted pick (weight 0 = never); empty pool or empty
-      text contributes nothing.
+    - `rotate: false` — weighted pick (weight 0 = never, unless EVERY live
+      fragment of that kind is weight ≤ 0 — then falls back to uniform;
+      picking something beats silence). Empty pool or empty text contributes
+      nothing.
   """
   def draw(fragments, seen, template, recipient_id, date, salt, guard) do
     live = Enum.filter(fragments, &(&1.status == "live"))
