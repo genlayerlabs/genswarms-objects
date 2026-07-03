@@ -1,10 +1,12 @@
 defmodule Genswarms.Cron.Schedule do
   @moduledoc """
-  Datetime parsing for the global cron object.
+  Schedule kinds for the genswarms cron scheduler package.
 
-  Micro Markets cron jobs are not a generic cron-expression language. A job has
-  one due timestamp, stored as Unix milliseconds, and the scheduler wakes it
-  when `next_run_at <= now`.
+  A schedule normalizes to one of three JSON-pure kind maps (persisted
+  verbatim): a one-shot `run_at` (Unix milliseconds), a fixed-rate `every_ms`
+  interval, or a 5-field UTC `cron` expression. The scheduler wakes a job when
+  `next_run_at <= now`; `next_after/3` implements the grid rule — the smallest
+  scheduled point strictly after now.
   """
 
   @doc """
