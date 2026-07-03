@@ -1,7 +1,7 @@
 defmodule Genswarms.Browser.Core do
   @moduledoc """
   Promotable core for the allowlist-capped web browser. No wingston/campaign
-  concept — could move to `Genswarms.Browse` unchanged.
+  concept — could move to `Genswarms.Browser` unchanged.
 
   Security model (measured against agent-browser 0.27.1 — see the spec): this module
   is the SOLE gate on which URL the browser may sit on. `global_ip?/1` is the SSRF
@@ -54,6 +54,31 @@ defmodule Genswarms.Browser.Core do
 
   defp allowed?(host, allowset) do
     if MapSet.member?(allowset, String.downcase(host)), do: :ok, else: {:error, {:not_allowed, host}}
+  end
+
+  @doc "Normalize a host for matching: lowercase, strip one trailing dot, punycode→ascii."
+  @spec normalize_host(String.t()) :: String.t()
+  def normalize_host(host) when is_binary(host) do
+    host
+    |> String.downcase()
+    |> String.trim_trailing(".")
+    |> to_ascii()
+  end
+
+  # Seed blocklist is all-ASCII; keep this a straight passthrough (no IDNA dependency).
+  defp to_ascii(host), do: host
+
+  @doc "True iff `host` is blocked by `blockset` on a LABEL boundary (apex or subdomain)."
+  @spec blocked?(String.t(), MapSet.t(String.t())) :: boolean()
+  def blocked?(host, blockset) do
+    h = normalize_host(host)
+    labels = String.split(h, ".")
+
+    0..(length(labels) - 1)
+    |> Enum.any?(fn i ->
+      suffix = labels |> Enum.drop(i) |> Enum.join(".")
+      MapSet.member?(blockset, suffix)
+    end)
   end
 
   defp ssrf_safe?(host, resolver) do
