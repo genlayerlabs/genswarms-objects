@@ -19,7 +19,7 @@
 ExUnit.start()
 # act/3 must NEVER be called when the guard correctly rejects a flag-shaped text.
 defmodule MockNoAct do
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
   @impl true
   def navigate(_u, _s, _a), do: {:ok, %{landed_url: "https://allowed.example.com/landed", text: "hi"}}
   @impl true
@@ -34,7 +34,7 @@ end
 # render_sync/2 runs the renderer callback inside a SPAWNED worker process, so a plain
 # Process dictionary wouldn't be visible back in the test process — use a named Agent.
 defmodule MockRecordAct do
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
   @recorder :browse_argv_guard_recorder
 
   def start_recorder! do
@@ -56,9 +56,9 @@ defmodule MockRecordAct do
   def close(_s), do: :ok
 end
 
-defmodule GenswarmsBrowseArgvGuardTest do
+defmodule GenswarmsBrowserArgvGuardTest do
   use ExUnit.Case, async: false
-  alias Genswarms.Browse
+  alias Genswarms.Browser
 
   @url "https://allowed.example.com/p"
 
@@ -68,7 +68,7 @@ defmodule GenswarmsBrowseArgvGuardTest do
     on_exit(fn -> File.rm(allow) end)
 
     {:ok, st} =
-      Browse.init(%{
+      Browser.init(%{
         allowlist_path: allow,
         renderer: renderer,
         # injected — no DNS, no curl, no browser
@@ -83,13 +83,13 @@ defmodule GenswarmsBrowseArgvGuardTest do
   # `type` needs a live session first, same as every other interactive action.
   defp with_session(renderer) do
     st = state_for(renderer)
-    {:reply, _json, st2} = Browse.handle_message(:agentA, ~s({"action":"render","url":"#{@url}"}), st)
+    {:reply, _json, st2} = Browser.handle_message(:agentA, ~s({"action":"render","url":"#{@url}"}), st)
     st2
   end
 
   defp type_reply(st, text) do
     body = Jason.encode!(%{"action" => "type", "ref" => "e39", "text" => text})
-    Browse.handle_message(:agentA, body, st)
+    Browser.handle_message(:agentA, body, st)
   end
 
   test "rejects the CONFIRMED repro ('--json') with a clear bad_arg error, never reaching the renderer" do
@@ -161,7 +161,7 @@ defmodule GenswarmsBrowseArgvGuardTest do
   test "still enforces the existing ref-shape and length checks (guard is additive, not a replacement)" do
     st = with_session(MockNoAct)
     body = Jason.encode!(%{"action" => "type", "ref" => "not-a-ref", "text" => "benign text"})
-    {:reply, json, _st} = Browse.handle_message(:agentA, body, st)
+    {:reply, json, _st} = Browser.handle_message(:agentA, body, st)
     m = Jason.decode!(json)
 
     assert m["error"] == "bad_arg", "malformed ref should still hit the generic bad_arg path"

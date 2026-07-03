@@ -78,7 +78,7 @@ defmodule Genswarms.Metrics do
     reply_sent reply_failed reply_suppressed reply_reprompt reply_fallback card_sent
     eligible_pending
     connect new_conversation returning_user notes_written inbox_full inbox_dropped ask
-    compaction browse_ok browse_total orchestrator_boot reengage agent_spawn_failed
+    compaction browse_ok browse_total browser_ok browser_total orchestrator_boot reengage agent_spawn_failed
     proactive_sent progress_sent progress_edit llm_error spawn_shed metrics_rejected
     llm_error_max_turns llm_error_api
     llm_proxy_requests llm_proxy_stream llm_proxy_budget_degraded llm_proxy_budget_block
