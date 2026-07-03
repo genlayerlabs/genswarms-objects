@@ -49,6 +49,7 @@ defmodule Genswarms.Cron do
       max_attempts: Map.get(config, :max_attempts, 3),
       retry_backoff_ms: Map.get(config, :retry_backoff_ms, 60_000),
       async?: Map.get(config, :async?, true),
+      min_period_ms: Map.get(config, :min_period_ms, 60_000),
       jobs: jobs,
       tasks: %{},
       next_id: max(store_call(store_mod, :max_cron_job_id, [], 0) + 1, next_memory_id(jobs)),
@@ -153,10 +154,12 @@ defmodule Genswarms.Cron do
   defp create_job(from, msg, state) do
     now = state.now_fn.()
 
-    with {:ok, run_at_ms} <- Schedule.parse(due_value(msg)) do
+    with {:ok, norm} <- Schedule.normalize(due_value(msg), now),
+         :ok <- check_floor(norm, state),
+         :ok <- check_not_past(norm, now, state) do
       case existing_dedupe_job(state, msg["dedupe_key"]) do
         nil ->
-          case build_job(from, msg, run_at_ms, state, now) do
+          case build_job(from, msg, norm, state, now) do
             {:ok, job} ->
               state =
                 %{
@@ -207,21 +210,25 @@ defmodule Genswarms.Cron do
     end)
   end
 
-  defp build_job(from, msg, run_at_ms, state, now) do
+  defp build_job(from, msg, norm, state, now) do
     id = state.next_id
 
-    with {:ok, payload} <- normalize_payload(msg, state) do
+    with {:ok, payload} <- normalize_payload(msg, state),
+         {:ok, first} <- Schedule.first_run_at(norm, now) do
       {:ok,
        %{
          id: id,
          name: safe_text(msg["name"] || "cron job #{id}", 120),
-         schedule: %{"run_at_ms" => run_at_ms},
-         next_run_at: run_at_ms,
+         schedule: norm,
+         next_run_at: first,
          last_run_at: nil,
          last_status: nil,
          last_error: nil,
          state: "active",
-         repeat: false,
+         misfire: normalize_misfire(msg["misfire"]),
+         consecutive_failures: 0,
+         paused_by: nil,
+         claimed_due: nil,
          attempts: 0,
          max_attempts: positive_int(msg["max_attempts"], state.max_attempts),
          retry_backoff_ms: nonnegative_int(msg["retry_backoff_ms"], state.retry_backoff_ms),
@@ -235,6 +242,21 @@ defmodule Genswarms.Cron do
        }}
     end
   end
+
+  defp check_floor(%{"kind" => "every_ms", "every_ms" => n}, state)
+       when n < state.min_period_ms,
+       do: {:error, "every_ms below min_period_ms (#{state.min_period_ms})"}
+
+  defp check_floor(_norm, _state), do: :ok
+
+  defp check_not_past(%{"kind" => "run_at", "run_at_ms" => ms}, now, state)
+       when ms < now - state.tick_ms,
+       do: {:error, "run_at_past"}
+
+  defp check_not_past(_norm, _now, _state), do: :ok
+
+  defp normalize_misfire("skip"), do: "skip"
+  defp normalize_misfire(_), do: "coalesce"
 
   defp normalize_payload(msg, state) do
     target = to_string(msg["target"] || "")
@@ -311,6 +333,7 @@ defmodule Genswarms.Cron do
       job
       | last_run_at: now,
         next_run_at: nil,
+        claimed_due: job.next_run_at,
         state: "running",
         attempts: Map.get(job, :attempts, 0) + 1,
         updated_at: now
@@ -386,14 +409,43 @@ defmodule Genswarms.Cron do
   end
 
   defp complete_job(job, %{status: "ok"} = result, now) do
-    %{
-      job
-      | state: "done",
-        next_run_at: nil,
-        last_status: result.status,
-        last_error: nil,
-        updated_at: now
-    }
+    if Schedule.recurring?(job.schedule) do
+      case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
+        {:ok, next} ->
+          %{
+            job
+            | state: "active",
+              next_run_at: next,
+              claimed_due: nil,
+              attempts: 0,
+              consecutive_failures: 0,
+              last_status: result.status,
+              last_error: nil,
+              updated_at: now
+          }
+
+        :none ->
+          %{
+            job
+            | state: "done",
+              next_run_at: nil,
+              claimed_due: nil,
+              last_status: result.status,
+              last_error: nil,
+              updated_at: now
+          }
+      end
+    else
+      %{
+        job
+        | state: "done",
+          next_run_at: nil,
+          claimed_due: nil,
+          last_status: result.status,
+          last_error: nil,
+          updated_at: now
+      }
+    end
   end
 
   defp complete_job(job, result, now) do
@@ -577,7 +629,6 @@ defmodule Genswarms.Cron do
       last_status: data["last_status"],
       last_error: data["last_error"],
       state: data["state"] || "active",
-      repeat: false,
       attempts: to_id(data["attempts"]) || 0,
       max_attempts: to_id(data["max_attempts"]) || 3,
       retry_backoff_ms: to_id(data["retry_backoff_ms"]) || 60_000,
