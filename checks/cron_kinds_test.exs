@@ -204,24 +204,59 @@ check.(
     job5_after.attempts == 0
 )
 
-# ── Vector 5b: run_now fires an active recurring job immediately and re-arms from that occurrence ──
+# ── Vector 5b: run_now fires an active recurring job immediately and re-arms
+# from that occurrence — advancing the clock before run_now (rather than
+# firing at the creation instant) is load-bearing: with the clock unmoved,
+# a "re-arm from now" implementation and a regressed "re-arm from the old
+# scheduled next_run_at" implementation could land on values close enough
+# to mask a regression. Advancing first makes the two diverge so the
+# assertion actually pins the anchor. ──
 
-{state5b, _clock5b, sink5b} = new_state.(base_now)
+{state5b, clock5b, sink5b} = new_state.(base_now)
 
 {:reply, reply5b, state5b} = create.(state5b, :ops, %{schedule: %{every_ms: 300_000}})
 job5b_id = Jason.decode!(reply5b)["job_id"]
+
+set_clock.(clock5b, base_now + 120_000)
 
 {:reply, run5b_reply, state5b} = run_now.(state5b, :ops, "#{job5b_id}")
 decoded_run5b = Jason.decode!(run5b_reply)
 job5b_after = Map.fetch!(state5b.jobs, job5b_id)
 
 check.(
-  "run_now on an ACTIVE recurring job: trusted call delivers once now and next_run_at remains on the immediate occurrence's grid",
+  "run_now on an ACTIVE every_ms job: trusted call delivers once now and permanently re-phases next_run_at from the run_now occurrence (now + period), not the old scheduled grid point",
   decoded_run5b["ok"] == true and
     decoded_run5b["launched"] == 1 and
     sink_messages.(sink5b) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
     job5b_after.state == "active" and
-    job5b_after.next_run_at == base_now + 300_000
+    job5b_after.next_run_at == base_now + 120_000 + 300_000
+)
+
+# ── Vector 5b-cron: run_now on a cron-kind job stays on the absolute grid —
+# contrast with 5b: every_ms permanently re-phases from the run_now
+# occurrence, but a cron expression is anchored to calendar points, so
+# firing early doesn't move next_run_at off the grid it already had. ──
+
+{state5bc, clock5bc, sink5bc} = new_state.(base_now)
+
+{:reply, reply5bc, state5bc} = create.(state5bc, :ops, %{schedule: %{cron: "0 * * * *"}})
+job5bc_id = Jason.decode!(reply5bc)["job_id"]
+job5bc_before = Map.fetch!(state5bc.jobs, job5bc_id)
+
+set_clock.(clock5bc, base_now + 1_800_000)
+
+{:reply, run5bc_reply, state5bc} = run_now.(state5bc, :ops, "#{job5bc_id}")
+decoded_run5bc = Jason.decode!(run5bc_reply)
+job5bc_after = Map.fetch!(state5bc.jobs, job5bc_id)
+
+check.(
+  "run_now on a cron-kind job: firing early delivers once now but leaves next_run_at on the same absolute grid point it already had (no re-phasing)",
+  decoded_run5bc["ok"] == true and
+    decoded_run5bc["launched"] == 1 and
+    sink_messages.(sink5bc) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
+    job5bc_after.state == "active" and
+    job5bc_before.next_run_at == base_now + 3_600_000 and
+    job5bc_after.next_run_at == job5bc_before.next_run_at
 )
 
 # ── Vector 5c: run_now rejects paused/terminal jobs and silently drops untrusted senders ──
