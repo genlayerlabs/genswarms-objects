@@ -34,7 +34,10 @@ defmodule FakeStore do
       else: Agent.start_link(fn -> rows end, name: __MODULE__)
   end
 
-  def load_cron_jobs(_states), do: Agent.get(__MODULE__, & &1)
+  # Honors the states filter like the real store seam: load_cron_jobs(states)
+  # returns only rows whose state is in the list.
+  def load_cron_jobs(states),
+    do: Agent.get(__MODULE__, & &1) |> Enum.filter(&(&1.state in states))
   def max_cron_job_id, do: Agent.get(__MODULE__, &Enum.reduce(&1, 0, fn r, m -> max(r.id, m) end))
 
   def save_cron_job(job) do
@@ -284,6 +287,175 @@ jobs7 = list.(state7, :ops)
 check.(
   "list rows carry kind and paused_by keys",
   match?([%{"kind" => "run_at", "paused_by" => nil}], jobs7)
+)
+
+# ── Vector 8 (I3): poisoned store row (running + bad cron expr + misfire skip) must not crash boot ──
+# recover_running_job's skip branch hits Schedule.next_after on the corrupt expr;
+# a {:error, _} there used to CaseClauseError straight out of init (boot crash-loop).
+
+bad_expr_row = %{
+  id: 50,
+  state: "running",
+  data: %{
+    "id" => 50,
+    "name" => "poisoned",
+    "state" => "running",
+    "schedule" => %{"kind" => "cron", "expr" => "garbage"},
+    "misfire" => "skip",
+    "next_run_at" => nil,
+    "last_run_at" => base_now - 1_000,
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "created_at" => base_now - 10_000,
+    "updated_at" => base_now - 1_000
+  }
+}
+
+FakeStore.start([bad_expr_row])
+
+boot8 =
+  try do
+    {s, _c, _snk} = init_state.(base_now, [], %{store_mod: FakeStore})
+    {:ok, s}
+  rescue
+    e -> {:raise, e.__struct__}
+  end
+
+tick8 =
+  case boot8 do
+    {:ok, s} ->
+      try do
+        {:reply, _r, s2} = tick.(s, :ops)
+        {:ok, s2}
+      rescue
+        e -> {:raise, e.__struct__}
+      end
+
+    other ->
+      other
+  end
+
+row8 = Enum.find(FakeStore.load_cron_jobs(["done", "failed"]), &(&1.id == 50))
+
+check.(
+  "poisoned running+skip row: boot recovers without raising, tick completes, job lands terminal with last_error carrying the schedule reason",
+  match?({:ok, _}, boot8) and
+    match?({:ok, _}, tick8) and
+    (case tick8 do
+       {:ok, s2} -> not Map.has_key?(s2.jobs, 50)
+       _ -> false
+     end) and
+    row8 != nil and
+    String.contains?(row8.data["last_error"] || "", "cron")
+)
+
+# ── Vector 9 (I4): a one-shot seed that already ran to a terminal row is a no-op on reboot ──
+# The terminal row isn't loaded (@load_states), so the in-memory dedupe can't see
+# it — the seed upsert must consult the STORE for terminal rows by dedupe_key.
+
+FakeStore.start([])
+
+oneshot_seeds = [
+  %{name: "once", dedupe_key: "seed:once", schedule: %{"run_at" => base_now - 3_600_000}, target: "proactive", message: %{"action" => "run"}}
+]
+
+{state9a, _clock9a, sink9a} = init_state.(base_now, oneshot_seeds, %{store_mod: FakeStore})
+{:reply, _tick9a, _state9a} = tick.(state9a, :ops)
+deliveries9_boot1 = length(Agent.get(sink9a, & &1))
+rows9_boot1 = Agent.get(FakeStore, & &1)
+
+{state9b, _clock9b, sink9b} = init_state.(base_now + 60_000, oneshot_seeds, %{store_mod: FakeStore})
+{:reply, _tick9b, _state9b} = tick.(state9b, :ops)
+deliveries9_boot2 = length(Agent.get(sink9b, & &1))
+rows9_boot2 = Agent.get(FakeStore, & &1)
+
+check.(
+  "one-shot past seed fires exactly once across reboots: boot1 delivers 1 and lands one done row; boot2 delivers 0, creates no job and no duplicate row",
+  deliveries9_boot1 == 1 and
+    length(rows9_boot1) == 1 and hd(rows9_boot1).state == "done" and
+    deliveries9_boot2 == 0 and
+    map_size(state9b.jobs) == 0 and
+    length(rows9_boot2) == 1
+)
+
+# ── Vector 10 (I5): misfire "skip" honored on ORDINARY downtime (active row loaded overdue) ──
+# Two identical active every_ms jobs missed 5 occurrences while the box was down
+# (not crashed mid-run): the skip one must advance to the next FUTURE grid point
+# with no catch-up delivery; the coalesce one keeps the single catch-up.
+
+hour = 3_600_000
+
+downtime_row = fn id, misfire ->
+  %{
+    id: id,
+    state: "active",
+    data: %{
+      "id" => id,
+      "name" => "downtime-#{misfire}",
+      "state" => "active",
+      "schedule" => %{"kind" => "every_ms", "every_ms" => hour},
+      "misfire" => misfire,
+      "next_run_at" => base_now - 5 * hour,
+      "last_run_at" => base_now - 6 * hour,
+      "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+      "created_at" => base_now - 100 * hour,
+      "updated_at" => base_now - 6 * hour
+    }
+  }
+end
+
+FakeStore.start([downtime_row.(60, "skip"), downtime_row.(61, "coalesce")])
+
+{state10, _clock10, sink10} = init_state.(base_now, [], %{store_mod: FakeStore})
+
+job10_skip = Map.fetch!(state10.jobs, 60)
+job10_coal = Map.fetch!(state10.jobs, 61)
+
+{:reply, tick10, state10} = tick.(state10, :ops)
+decoded_tick10 = Jason.decode!(tick10)
+job10_skip_after = Map.fetch!(state10.jobs, 60)
+
+check.(
+  "active skip job loaded 5 periods overdue: next_run_at advanced to the next FUTURE grid point at load, no catch-up delivery; coalesce twin keeps its past due and fires exactly one catch-up",
+  job10_skip.next_run_at == base_now + hour and
+    job10_coal.next_run_at == base_now - 5 * hour and
+    decoded_tick10["launched"] == 1 and
+    length(Agent.get(sink10, & &1)) == 1 and
+    job10_skip_after.next_run_at == base_now + hour
+)
+
+# ── Vector 11 (I6): active skip job with poisoned cron expr at load records last_error (no silent-park) ──
+# When load_misfire finds no next occurrence (poisoned expr) for an overdue
+# skip-misfire job, it must record last_error to prevent silent parking.
+
+poisoned_skip_row = %{
+  id: 70,
+  state: "active",
+  data: %{
+    "id" => 70,
+    "name" => "poisoned skip",
+    "state" => "active",
+    "schedule" => %{"kind" => "cron", "expr" => "garbage"},
+    "misfire" => "skip",
+    "next_run_at" => base_now - 60_000,
+    "last_run_at" => base_now - 120_000,
+    "last_error" => nil,
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "created_at" => base_now - 10_000,
+    "updated_at" => base_now - 120_000
+  }
+}
+
+FakeStore.start([poisoned_skip_row])
+
+{state11, _clock11, _sink11} = init_state.(base_now, [], %{store_mod: FakeStore})
+job11_loaded = Map.get(state11.jobs, 70)
+
+check.(
+  "active skip job with poisoned expr loaded overdue: next_run_at == nil AND last_error contains 'schedule'",
+  job11_loaded != nil and
+    job11_loaded.next_run_at == nil and
+    is_binary(job11_loaded.last_error) and
+    String.contains?(job11_loaded.last_error, "schedule")
 )
 
 failures = Agent.get(fails, &Enum.reverse/1)

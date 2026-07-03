@@ -27,6 +27,7 @@ defmodule Genswarms.Cron do
       store_call(store_mod, :load_cron_jobs, [@load_states], [])
       |> Enum.map(&normalize_loaded_job/1)
       |> Enum.map(&recover_running_job(&1, now))
+      |> Enum.map(&apply_load_misfire(&1, now))
       |> Map.new(fn job -> {job.id, job} end)
 
     state = %{
@@ -158,7 +159,12 @@ defmodule Genswarms.Cron do
   defp create_job(from, msg, state) do
     now = state.now_fn.()
 
-    with {:ok, norm} <- Schedule.normalize(due_value(msg), now),
+    # validate_create_fields must run BEFORE existing_dedupe_job/build_job:
+    # both to_string message-derived fields, and a crafted map/list value
+    # would raise Protocol.UndefinedError on the engine's rescue-less cast
+    # path (ObjectServer crash). Reject, never coerce.
+    with :ok <- validate_create_fields(msg),
+         {:ok, norm} <- Schedule.normalize(due_value(msg), now),
          :ok <- check_floor(norm, state),
          :ok <- check_not_past(norm, now, state) do
       case existing_dedupe_job(state, msg["dedupe_key"]) do
@@ -200,6 +206,38 @@ defmodule Genswarms.Cron do
         {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
   end
+
+  # Inbound create_job fields that flow into to_string/safe_text must be
+  # scalar strings (or absent). Numbers/maps/lists are rejected with a clear
+  # error — silent coercion would mint surprising names/keys, and non-scalars
+  # would crash the object.
+  defp validate_create_fields(msg) do
+    cond do
+      not string_or_nil?(msg["target"]) ->
+        {:error, "target must be a string"}
+
+      not (is_nil(msg["message"]) or is_map(msg["message"])) ->
+        {:error, "message must be an object"}
+
+      is_map(msg["message"]) and not string_or_nil?(msg["message"]["action"]) ->
+        {:error, "message.action must be a string"}
+
+      not string_or_nil?(msg["name"]) ->
+        {:error, "name must be a string"}
+
+      not string_or_nil?(msg["dedupe_key"]) ->
+        {:error, "dedupe_key must be a string"}
+
+      not string_or_nil?(msg["misfire"]) ->
+        {:error, "misfire must be a string"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp string_or_nil?(nil), do: true
+  defp string_or_nil?(value), do: is_binary(value)
 
   defp existing_dedupe_job(_state, nil), do: nil
   defp existing_dedupe_job(_state, ""), do: nil
@@ -257,10 +295,26 @@ defmodule Genswarms.Cron do
   defp apply_seeds(state, [], _now), do: state
 
   defp apply_seeds(state, seeds, now) do
-    Enum.reduce(seeds, state, fn seed, st -> apply_seed(st, seed, now) end)
+    # Terminal rows are not loaded (@load_states), so the in-memory dedupe
+    # cannot see a one-shot seed that already ran to done/failed (or was
+    # deleted) — it would be re-created with the past-guard skipped and fire
+    # again on every boot, accreting duplicate rows. Consult the store once
+    # for terminal dedupe_keys; a one-shot seed with a terminal row is a no-op.
+    terminal_keys =
+      store_call(state.store_mod, :load_cron_jobs, [@terminal_states], [])
+      |> Enum.map(&terminal_dedupe_key/1)
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
+
+    Enum.reduce(seeds, state, fn seed, st -> apply_seed(st, seed, now, terminal_keys) end)
   end
 
-  defp apply_seed(state, seed, now) do
+  defp terminal_dedupe_key(%{data: %{"dedupe_key" => dk}}) when is_binary(dk) and dk != "",
+    do: dk
+
+  defp terminal_dedupe_key(_row), do: nil
+
+  defp apply_seed(state, seed, now, terminal_keys) do
     dk = seed[:dedupe_key] || seed["dedupe_key"]
 
     if dk in [nil, ""] do
@@ -286,31 +340,43 @@ defmodule Genswarms.Cron do
     with {:ok, norm} <- Schedule.normalize(msg["schedule"], now),
          :ok <- check_floor(norm, state),
          {:ok, _payload} <- normalize_payload(msg, state) do
-      upsert_seed(state, msg, norm, now)
+      upsert_seed(state, msg, norm, now, terminal_keys)
     else
       {:error, reason} ->
         raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
     end
   end
 
-  defp upsert_seed(state, msg, norm, now) do
+  defp upsert_seed(state, msg, norm, now, terminal_keys) do
     case existing_dedupe_job(state, msg["dedupe_key"]) do
       nil ->
-        case build_job("seed", msg, norm, state, now) do
-          {:ok, job} ->
-            %{
-              state
-              | jobs: Map.put(state.jobs, job.id, job),
-                next_id: max(state.next_id, job.id + 1)
-            }
-            |> persist_job(job)
-
-          {:error, reason} ->
-            raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
+        # One-shot seed whose dedupe_key already has a terminal store row:
+        # it ran (or was deleted) — never resurrect/re-fire it (I4). Recurring
+        # seeds keep declarative semantics: the config says they should exist.
+        if norm["kind"] == "run_at" and
+             MapSet.member?(terminal_keys, safe_optional(msg["dedupe_key"], 200)) do
+          state
+        else
+          insert_seed_job(state, msg, norm, now)
         end
 
       job ->
         update_seed_job(state, job, msg, norm, now)
+    end
+  end
+
+  defp insert_seed_job(state, msg, norm, now) do
+    case build_job("seed", msg, norm, state, now) do
+      {:ok, job} ->
+        %{
+          state
+          | jobs: Map.put(state.jobs, job.id, job),
+            next_id: max(state.next_id, job.id + 1)
+        }
+        |> persist_job(job)
+
+      {:error, reason} ->
+        raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
     end
   end
 
@@ -506,7 +572,24 @@ defmodule Genswarms.Cron do
         state
 
       job ->
-        job = complete_job(job, result, now)
+        # An operator pause that landed while this occurrence was in flight must
+        # survive the task result: record the outcome, clear the claim, but do
+        # NOT rebuild the job "active"/re-arm it (delete already survives — a
+        # terminal job is removed from the map, so the nil clause above hits).
+        job =
+          if job.state == "paused" do
+            %{
+              job
+              | claimed_due: nil,
+                attempts: 0,
+                last_status: result.status,
+                last_error: result.error,
+                updated_at: now
+            }
+          else
+            complete_job(job, result, now)
+          end
+
         store_call(state.store_mod, :save_cron_run, [job, result], :ok)
 
         jobs =
@@ -547,14 +630,17 @@ defmodule Genswarms.Cron do
               updated_at: now
           }
 
-        :none ->
+        no_next ->
+          # :none or {:error, reason} (poisoned stored expr): no next
+          # occurrence exists — terminal done, the schedule reason (if any)
+          # kept visible in last_error.
           %{
             job
             | state: "done",
               next_run_at: nil,
               claimed_due: nil,
               last_status: result.status,
-              last_error: nil,
+              last_error: schedule_error(no_next),
               updated_at: now
           }
       end
@@ -610,8 +696,13 @@ defmodule Genswarms.Cron do
         %{base | state: "paused", paused_by: "breaker", next_run_at: nil}
       else
         case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
-          {:ok, next} -> %{base | state: "active", next_run_at: next}
-          :none -> %{base | state: "failed", next_run_at: nil}
+          {:ok, next} ->
+            %{base | state: "active", next_run_at: next}
+
+          # :none or {:error, _}: no next occurrence — terminal failed; base
+          # already carries the (more proximate) delivery error in last_error.
+          _no_next ->
+            %{base | state: "failed", next_run_at: nil}
         end
       end
     else
@@ -626,6 +717,12 @@ defmodule Genswarms.Cron do
       }
     end
   end
+
+  # Schedule.next_after on a corrupt/poisoned stored schedule returns
+  # {:error, reason}; call sites treat it exactly like :none (no next
+  # occurrence). Where a job map is in hand this keeps the reason visible.
+  defp schedule_error(:none), do: nil
+  defp schedule_error({:error, reason}), do: "schedule error: #{reason}"
 
   defp retry_delay(job, attempts) do
     base = max(Map.get(job, :retry_backoff_ms, 60_000), 0)
@@ -661,6 +758,15 @@ defmodule Genswarms.Cron do
       nil ->
         {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
 
+      # Resume only acts on paused jobs. Resuming a RUNNING job used to
+      # double-fire it (running has next_run_at nil -> apply_resume_misfire
+      # read that as a missed occurrence and coalesce-armed `now` while the
+      # first occurrence was still in flight); resuming an ACTIVE job is
+      # meaningless. Contract: ok:false "job not paused" + the current state.
+      %{state: other} = _job when other != "paused" ->
+        {:reply, Jason.encode!(%{ok: false, error: "job not paused", job_id: id, state: other}),
+         state}
+
       job ->
         now = state.now_fn.()
 
@@ -694,7 +800,9 @@ defmodule Genswarms.Cron do
         "skip" ->
           case Schedule.next_after(job.schedule, job.last_run_at || job.created_at, now) do
             {:ok, next} -> %{job | next_run_at: next}
-            :none -> %{job | next_run_at: nil}
+            # :none or {:error, _}: nothing to arm — the caller's
+            # "job has no future run_at" reply surfaces it.
+            _no_next -> %{job | next_run_at: nil}
           end
 
         _coalesce ->
@@ -868,7 +976,10 @@ defmodule Genswarms.Cron do
           "skip" ->
             case Schedule.next_after(schedule, job.last_run_at || job.created_at, now) do
               {:ok, next} -> next
-              :none -> now
+              # :none or {:error, _} (poisoned stored expr): fall back to the
+              # coalesce recovery point instead of crashing init — the run's
+              # completion then parks the job terminal with the reason.
+              _no_next -> now
             end
 
           _coalesce ->
@@ -889,6 +1000,30 @@ defmodule Genswarms.Cron do
   end
 
   defp recover_running_job(job, _now), do: job
+
+  # Load-time misfire pass for ORDINARY downtime: an ACTIVE recurring job whose
+  # stored next_run_at is already past missed occurrences while the scheduler
+  # simply wasn't running (no crash mid-run — recover_running_job handles that).
+  # "skip" advances to the next FUTURE grid point (no catch-up delivery, same
+  # grid base as the missed due); "coalesce" (default) leaves the past due in
+  # place — exactly one catch-up, unchanged behavior. One-shots are untouched
+  # (a past one-shot still fires its catch-up). Runs after recover_running_job,
+  # which never leaves a strictly-past next_run_at, so the passes don't overlap.
+  defp apply_load_misfire(%{state: "active", misfire: "skip", next_run_at: due} = job, now)
+       when is_integer(due) and due < now do
+    if Schedule.recurring?(Map.get(job, :schedule)) do
+      case Schedule.next_after(job.schedule, due, now) do
+        {:ok, next} -> %{job | next_run_at: next, updated_at: now}
+        # :none or {:error, _}: nothing to arm — same shape as a skip resume.
+        # Record the schedule error to prevent silent-park; observable via last_error.
+        _no_next -> %{job | next_run_at: nil, last_error: "schedule error: no next occurrence at load", updated_at: now}
+      end
+    else
+      job
+    end
+  end
+
+  defp apply_load_misfire(job, _now), do: job
 
   defp positive_int(value, default) do
     case to_id(value) do

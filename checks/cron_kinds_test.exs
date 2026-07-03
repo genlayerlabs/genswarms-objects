@@ -424,6 +424,204 @@ check.(
     length(sink_messages.(sink14)) == 1
 )
 
+# ── Async harness: like new_state but async?: true with a slow deliver_fn, so a
+# vector can act on the object WHILE an occurrence is in flight, then hand the
+# task result back via handle_info (the engine's real delivery path).
+
+new_state_async = fn now ->
+  {:ok, clock} = Agent.start_link(fn -> now end)
+  {:ok, sink} = Agent.start_link(fn -> [] end)
+
+  config = %{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: false,
+    async?: true,
+    now_fn: fn -> Agent.get(clock, & &1) end,
+    deliver_fn: fn target, from, json ->
+      Process.sleep(50)
+      Agent.update(sink, &[{target, from, json} | &1])
+      :ok
+    end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000
+  }
+
+  {:ok, state} = Cron.init(config)
+  {state, clock, sink}
+end
+
+drain_task = fn state ->
+  receive do
+    {ref, {:cron_run_result, _, _} = res} ->
+      {:noreply, s} = Cron.handle_info({ref, res}, state)
+      s
+  after
+    2_000 -> raise "async vector: no task result arrived"
+  end
+end
+
+# ── Vector 15 (I1): pause issued while an occurrence is in flight survives the task result ──
+
+{state15, clock15, _sink15} = new_state_async.(base_now)
+
+{:reply, reply15, state15} = create.(state15, :ops, %{schedule: %{every_ms: 300_000}})
+job15_id = Jason.decode!(reply15)["job_id"]
+
+set_clock.(clock15, base_now + 300_000)
+{:reply, _tick15, state15} = tick.(state15, :ops)
+
+{:reply, pause15, state15} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "pause", job_id: job15_id}), state15)
+
+state15 = drain_task.(state15)
+job15 = Map.fetch!(state15.jobs, job15_id)
+
+check.(
+  "pause during an in-flight occurrence survives the task result: state stays paused, no re-arm, claimed_due/attempts cleared, last_status recorded",
+  Jason.decode!(pause15)["ok"] == true and
+    job15.state == "paused" and
+    job15.next_run_at == nil and
+    job15.claimed_due == nil and
+    job15.attempts == 0 and
+    job15.last_status == "ok"
+)
+
+# ── Vector 16 (I2): resume on a RUNNING job is rejected — no second concurrent launch ──
+
+{state16, clock16, sink16} = new_state_async.(base_now)
+
+{:reply, reply16, state16} = create.(state16, :ops, %{schedule: %{every_ms: 300_000}})
+job16_id = Jason.decode!(reply16)["job_id"]
+
+set_clock.(clock16, base_now + 300_000)
+{:reply, _tick16a, state16} = tick.(state16, :ops)
+tasks16_in_flight = map_size(state16.tasks)
+
+{:reply, resume16, state16} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job16_id}), state16)
+
+decoded_resume16 = Jason.decode!(resume16)
+
+{:reply, tick16b, state16} = tick.(state16, :ops)
+decoded_tick16b = Jason.decode!(tick16b)
+
+state16 = drain_task.(state16)
+job16 = Map.fetch!(state16.jobs, job16_id)
+
+check.(
+  "resume on a RUNNING job: rejected ok:false \"job not paused\", still one task in flight, no second launch, job re-arms normally after the result",
+  tasks16_in_flight == 1 and
+    decoded_resume16["ok"] == false and
+    decoded_resume16["error"] == "job not paused" and
+    decoded_resume16["state"] == "running" and
+    decoded_tick16b["launched"] == 0 and
+    length(sink_messages.(sink16)) == 1 and
+    job16.state == "active" and
+    job16.next_run_at == base_now + 600_000
+)
+
+# ── Vector 16b (I2): resume on an ACTIVE (never paused) job is a rejected no-op too ──
+
+{state16b, _clock16b, _sink16b} = new_state.(base_now)
+
+{:reply, reply16b, state16b} = create.(state16b, :ops, %{schedule: %{every_ms: 300_000}})
+job16b_id = Jason.decode!(reply16b)["job_id"]
+
+{:reply, resume16b, state16b} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job16b_id}), state16b)
+
+decoded_resume16b = Jason.decode!(resume16b)
+job16b = Map.fetch!(state16b.jobs, job16b_id)
+
+check.(
+  "resume on an ACTIVE job: rejected ok:false \"job not paused\", next_run_at untouched",
+  decoded_resume16b["ok"] == false and
+    decoded_resume16b["error"] == "job not paused" and
+    decoded_resume16b["state"] == "active" and
+    job16b.next_run_at == base_now + 300_000
+)
+
+# ── Vector 17 (I3): poisoned stored cron expr must not crash completion — terminal, reason kept ──
+# A corrupt persisted row is the real ingress (create validates exprs); poisoning
+# the in-memory schedule after create reproduces it without a store harness.
+
+{state17, clock17, _sink17} = new_state.(base_now)
+
+{:reply, reply17, state17} = create.(state17, :ops, %{schedule: %{cron: "0 * * * *"}})
+job17_id = Jason.decode!(reply17)["job_id"]
+
+poisoned17 = %{
+  Map.fetch!(state17.jobs, job17_id)
+  | schedule: %{"kind" => "cron", "expr" => "garbage"}
+}
+
+state17 = %{state17 | jobs: Map.put(state17.jobs, job17_id, poisoned17)}
+set_clock.(clock17, base_now + 3_600_000)
+
+result17 =
+  try do
+    {:reply, _r, s} = tick.(state17, :ops)
+    {:ok, s}
+  rescue
+    e -> {:raise, e.__struct__}
+  end
+
+check.(
+  "poisoned cron expr on a due job: tick completes without raising, job goes terminal (removed from active set)",
+  match?({:ok, _}, result17) and
+    (case result17 do
+       {:ok, s} -> not Map.has_key?(s.jobs, job17_id)
+       _ -> false
+     end)
+)
+
+# ── Vector 18 (I6): crafted non-scalar string fields are rejected ok:false, never raise ──
+# Map/list values in to_string'd fields used to raise Protocol.UndefinedError;
+# the engine cast path has no rescue, so that was an ObjectServer crash.
+
+{state18a, _clock18a, _sink18a} = new_state.(base_now)
+
+bad18 = [
+  {"map target", %{target: %{"a" => 1}}},
+  {"list target", %{target: ["proactive"]}},
+  {"map message.action", %{message: %{"action" => %{"a" => 1}}}},
+  {"list message (non-object)", %{message: ["run"]}},
+  {"map name", %{name: %{"a" => 1}}},
+  {"map dedupe_key", %{dedupe_key: %{"a" => 1}}},
+  {"list misfire", %{misfire: ["skip"]}}
+]
+
+results18 =
+  for {label, extra} <- bad18 do
+    outcome =
+      try do
+        case create.(state18a, :ops, Map.merge(%{schedule: %{every_ms: 300_000}}, extra)) do
+          {:reply, r, _s} -> Jason.decode!(r)["ok"]
+          {:noreply, _s} -> :noreply
+        end
+      rescue
+        e -> {:raise, e.__struct__}
+      end
+
+    {label, outcome}
+  end
+
+check.(
+  "crafted non-scalar create_job fields (target/message.action/name/dedupe_key/misfire) all reject ok:false without raising",
+  Enum.all?(results18, fn {_label, outcome} -> outcome == false end)
+)
+
+# valid create still works after validation was added (no over-rejection)
+{:reply, reply18ok, _state18a} =
+  create.(state18a, :ops, %{schedule: %{every_ms: 300_000}, name: "fine", dedupe_key: "dk18", misfire: "skip"})
+
+check.(
+  "valid scalar fields still accepted after input validation",
+  Jason.decode!(reply18ok)["ok"] == true
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
