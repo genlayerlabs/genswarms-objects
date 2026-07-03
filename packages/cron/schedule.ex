@@ -55,4 +55,76 @@ defmodule Genswarms.Cron.Schedule do
   def parse(_value), do: {:error, "run_at is required"}
 
   def now_ms, do: System.system_time(:millisecond)
+
+  alias Genswarms.Cron.CronExpr
+
+  @doc """
+  Normalize a schedule value into its kind map (JSON-pure, persisted verbatim):
+  run_at / every_ms / cron. Cron expressions are validated AND satisfiability-
+  checked (a bounded next-match from now must exist).
+  """
+  def normalize(%{} = m, now_ms) do
+    cond do
+      every = m["every_ms"] || m[:every_ms] ->
+        if is_integer(every) and every > 0,
+          do: {:ok, %{"kind" => "every_ms", "every_ms" => every}},
+          else: {:error, "every_ms must be a positive integer"}
+
+      expr = m["cron"] || m[:cron] ->
+        with {:ok, parsed} <- CronExpr.parse(expr),
+             {:ok, _} <- satisfiable(parsed, now_ms) do
+          {:ok, %{"kind" => "cron", "expr" => expr}}
+        end
+
+      due = m["run_at"] || m[:run_at] || m["at"] || m[:at] || m["next_run_at"] || m[:next_run_at] ->
+        with {:ok, ms} <- parse(due), do: {:ok, %{"kind" => "run_at", "run_at_ms" => ms}}
+
+      true ->
+        {:error, "schedule needs run_at, every_ms, or cron"}
+    end
+  end
+
+  def normalize(value, _now_ms) when is_binary(value) or is_integer(value) do
+    with {:ok, ms} <- parse(value), do: {:ok, %{"kind" => "run_at", "run_at_ms" => ms}}
+  end
+
+  def normalize(_value, _now_ms), do: {:error, "schedule is required"}
+
+  defp satisfiable(parsed, now_ms) do
+    case CronExpr.next(parsed, now_ms) do
+      {:ok, ms} -> {:ok, ms}
+      :none -> {:error, "cron expression is unsatisfiable"}
+    end
+  end
+
+  def recurring?(%{"kind" => k}), do: k in ["every_ms", "cron"]
+  def recurring?(_), do: false
+
+  def first_run_at(%{"kind" => "run_at", "run_at_ms" => ms}, _created), do: {:ok, ms}
+  def first_run_at(%{"kind" => "every_ms", "every_ms" => n}, created)
+      when is_integer(n) and n > 0 and is_integer(created),
+      do: {:ok, created + n}
+
+  def first_run_at(%{"kind" => "cron", "expr" => expr}, created) do
+    with {:ok, parsed} <- CronExpr.parse(expr), do: satisfiable(parsed, created)
+  end
+
+  def first_run_at(_norm, _created), do: {:error, "invalid schedule"}
+
+  @doc "The grid rule: smallest scheduled point strictly after now (spec-pinned)."
+  def next_after(%{"kind" => "every_ms", "every_ms" => n}, due, now)
+      when is_integer(due) and is_integer(now) and is_integer(n) and n > 0 do
+    {:ok, due + (div(max(now - due, 0), n) + 1) * n}
+  end
+
+  def next_after(%{"kind" => "cron", "expr" => expr}, due, now) do
+    with {:ok, parsed} <- CronExpr.parse(expr) do
+      case CronExpr.next(parsed, max(due, now)) do
+        {:ok, ms} -> {:ok, ms}
+        :none -> :none
+      end
+    end
+  end
+
+  def next_after(_norm, _due, _now), do: :none
 end

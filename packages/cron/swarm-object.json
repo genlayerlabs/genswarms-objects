@@ -1,4 +1,4 @@
 {
   "module": "Genswarms.Cron",
-  "files": ["schedule.ex", "cron.ex"]
+  "files": ["schedule.ex", "cron_expr.ex", "cron.ex"]
 }

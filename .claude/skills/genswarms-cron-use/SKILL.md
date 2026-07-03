@@ -14,6 +14,12 @@ A job is ONE due datetime + ONE stamped message to ONE allowlisted target.
 Cron owns timing/concurrency/persistence/audit; target objects keep domain
 authority (they validate the message they receive).
 
+## Schedule kinds
+
+- **One-shot**: `{"run_at": timestamp_or_iso_string}` — fires once at the specified UTC time.
+- **Fixed-rate**: `{"every_ms": 5000}` — repeats every 5000ms; after an occurrence, the next due time is the smallest multiple of the period that exceeds now.
+- **Cron expression**: `{"cron": "15,45 * * * *"}` — UTC, numeric-only fields; example runs at 15 and 45 minutes past every hour.
+
 ## Wiring
 
 ```elixir
@@ -23,7 +29,11 @@ authority (they validate the message they receive).
   allowed_targets: %{conversation_runtime: ["scheduled_turn"]}, # target => action allowlist
   store_mod: MyApp.CronStore,   # optional; absent = memory-only (lost on restart)
   events_mod: MyApp.Events,     # optional; object/4 audit sink, absent -> Logger
-  tick_ms: 60_000, max_concurrency: 16, max_attempts: 3
+  tick_ms: 60_000, max_concurrency: 16, max_attempts: 3,
+  breaker_threshold: 5,         # optional; consecutive failures before pause
+  seed_jobs: [                  # optional; upsert-by-dedupe_key at init
+    {%{"run_at" => "2026-07-15T10:00:00Z"}, :daily_report, %{"user_id" => 42}}
+  ]
 }}
 ```
 
@@ -32,6 +42,41 @@ empty `allowed_targets` (nothing deliverable). Both are the package's security
 posture — declare them, don't patch the module.
 
 Object protocol: `create_job` / `list` / `pause` / `resume` / `delete` / `tick` / `status`
+
+## Declarative seeding
+
+The `seed_jobs` config upserts jobs by `dedupe_key` at init — same key, same job.
+If the job already exists with the same dedupe_key and the schedule unchanged,
+`next_run_at` is preserved. Any invalid seed raises at boot.
+
+## Misfire policy
+
+After unscheduled downtime, a missed occurrence can be **coalesced** (default) —
+skip intermediate misfires and run once for the latest due time — or **skipped** —
+treat the job as caught up without running it.
+
+## Consecutive-failure breaker
+
+Jobs pause automatically when consecutive failures reach `breaker_threshold`;
+the job row shows `paused_by: "breaker"`. Resume manually resets the counter —
+recurring jobs never reach a terminal-failed state.
+
+## Minimum period floor
+
+One-shot and cron jobs are not subject to a `min_period_ms` floor. Fixed-rate jobs
+(every_ms) enforce it: the engine will never attempt a retry or re-arm sooner.
+
+## Grid rule
+
+Recurring jobs re-arm on their original grid: after an occurrence with due time D,
+the next due time is the smallest D+k·period strictly greater than now. This
+guarantees exactly one catch-up after downtime and no duplicate runs.
+
+## List rows
+
+The `list` response rows now include `kind` (one of `"one_shot"`, `"fixed_rate"`,
+`"cron_expr"`) and `paused_by` (absent if running, or `"breaker"` if paused by
+the consecutive-failure breaker).
 
 ## Store seam (optional)
 
