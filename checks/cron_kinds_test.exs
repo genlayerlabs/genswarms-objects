@@ -424,6 +424,70 @@ check.(
     length(sink_messages.(sink14)) == 1
 )
 
+# ── Async harness: like new_state but async?: true with a slow deliver_fn, so a
+# vector can act on the object WHILE an occurrence is in flight, then hand the
+# task result back via handle_info (the engine's real delivery path).
+
+new_state_async = fn now ->
+  {:ok, clock} = Agent.start_link(fn -> now end)
+  {:ok, sink} = Agent.start_link(fn -> [] end)
+
+  config = %{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: false,
+    async?: true,
+    now_fn: fn -> Agent.get(clock, & &1) end,
+    deliver_fn: fn target, from, json ->
+      Process.sleep(50)
+      Agent.update(sink, &[{target, from, json} | &1])
+      :ok
+    end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000
+  }
+
+  {:ok, state} = Cron.init(config)
+  {state, clock, sink}
+end
+
+drain_task = fn state ->
+  receive do
+    {ref, {:cron_run_result, _, _} = res} ->
+      {:noreply, s} = Cron.handle_info({ref, res}, state)
+      s
+  after
+    2_000 -> raise "async vector: no task result arrived"
+  end
+end
+
+# ── Vector 15 (I1): pause issued while an occurrence is in flight survives the task result ──
+
+{state15, clock15, _sink15} = new_state_async.(base_now)
+
+{:reply, reply15, state15} = create.(state15, :ops, %{schedule: %{every_ms: 300_000}})
+job15_id = Jason.decode!(reply15)["job_id"]
+
+set_clock.(clock15, base_now + 300_000)
+{:reply, _tick15, state15} = tick.(state15, :ops)
+
+{:reply, pause15, state15} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "pause", job_id: job15_id}), state15)
+
+state15 = drain_task.(state15)
+job15 = Map.fetch!(state15.jobs, job15_id)
+
+check.(
+  "pause during an in-flight occurrence survives the task result: state stays paused, no re-arm, claimed_due/attempts cleared, last_status recorded",
+  Jason.decode!(pause15)["ok"] == true and
+    job15.state == "paused" and
+    job15.next_run_at == nil and
+    job15.claimed_due == nil and
+    job15.attempts == 0 and
+    job15.last_status == "ok"
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do

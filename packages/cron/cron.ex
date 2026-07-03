@@ -506,7 +506,24 @@ defmodule Genswarms.Cron do
         state
 
       job ->
-        job = complete_job(job, result, now)
+        # An operator pause that landed while this occurrence was in flight must
+        # survive the task result: record the outcome, clear the claim, but do
+        # NOT rebuild the job "active"/re-arm it (delete already survives — a
+        # terminal job is removed from the map, so the nil clause above hits).
+        job =
+          if job.state == "paused" do
+            %{
+              job
+              | claimed_due: nil,
+                attempts: 0,
+                last_status: result.status,
+                last_error: result.error,
+                updated_at: now
+            }
+          else
+            complete_job(job, result, now)
+          end
+
         store_call(state.store_mod, :save_cron_run, [job, result], :ok)
 
         jobs =
