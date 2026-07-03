@@ -133,4 +133,35 @@ defmodule Genswarms.Tips.Core do
        :erlang.phash2({date, salt})}
     )
   end
+
+  @doc """
+  Record delivered rotating fragment ids for one recipient — call only after a
+  delivery ATTEMPT (mirror of roster's mark-after-attempt discipline). Returns
+  `{seen_list', reshuffled?}`.
+
+  Exhaustion reshuffle: once every live rotating fragment is in `seen_list`,
+  keep only the most recent `min(guard, pool_size - 1)` ids so the next cycle
+  never opens with a recent repeat (pool of 1 keeps none — repeats beat
+  starvation). Retired ids already in `seen_list` are preserved: retiring a
+  fragment never resurrects it as "fresh".
+  """
+  def commit(fragments, template, seen_list, rotating_ids, guard) do
+    rot_kinds = for %{rotate: true, kind: k} <- template, into: MapSet.new(), do: k
+
+    seen_list = Enum.reject(seen_list, &(&1 in rotating_ids)) ++ rotating_ids
+
+    live_rot =
+      for f <- fragments,
+          f.status == "live",
+          MapSet.member?(rot_kinds, f.kind),
+          into: MapSet.new(),
+          do: f.id
+
+    if MapSet.size(live_rot) > 0 and MapSet.subset?(live_rot, MapSet.new(seen_list)) do
+      keep = min(guard, MapSet.size(live_rot) - 1)
+      {if(keep > 0, do: Enum.take(seen_list, -keep), else: []), true}
+    else
+      {seen_list, false}
+    end
+  end
 end

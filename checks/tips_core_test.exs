@@ -114,3 +114,66 @@ defmodule TipsCoreDrawTest do
     end
   end
 end
+
+defmodule TipsCoreCommitTest do
+  use ExUnit.Case, async: false
+  alias Genswarms.Tips.Core
+
+  @template [%{kind: "body", rotate: true}]
+
+  defp bodies(n), do: for(i <- 1..n, do: Core.fragment("body", "Tip #{i}.", status: "live"))
+
+  test "full cycle: every live body drawn exactly once before any repeat, then reshuffle" do
+    pool = bodies(5)
+    {seen_ids, seen_list} =
+      Enum.reduce(1..5, {[], []}, fn day, {acc, seen_list} ->
+        {:ok, %{rotating_ids: [id]}} =
+          Core.draw(pool, %{"r" => seen_list}, @template, "r", "2026-07-#{day}", "s", 2)
+        {seen_list, reshuffled} = Core.commit(pool, @template, seen_list, [id], 2)
+        # reshuffle fires exactly on the 5th (coverage-completing) commit
+        assert reshuffled == (day == 5)
+        {[id | acc], seen_list}
+      end)
+    # all 5 distinct — no repeat within the cycle
+    assert seen_ids |> Enum.uniq() |> length() == 5
+    # after reshuffle only the most recent guard=2 survive, in draw order
+    assert length(seen_list) == 2
+    assert seen_list == (seen_ids |> Enum.reverse() |> Enum.take(-2))
+  end
+
+  test "re-committed id moves to most-recent without duplicating" do
+    pool = bodies(4)
+    [a, b, c | _] = Enum.map(pool, & &1.id)
+    {seen, false} = Core.commit(pool, @template, [a, b, c], [a], 20)
+    assert seen == [b, c, a]
+  end
+
+  test "pool of 1: guard clamps to 0 — repeats allowed rather than starvation" do
+    pool = bodies(1)
+    [id] = Enum.map(pool, & &1.id)
+    {seen, true} = Core.commit(pool, @template, [], [id], 20)
+    assert seen == []
+    # and the next draw still works
+    assert {:ok, %{rotating_ids: [^id]}} =
+             Core.draw(pool, %{"r" => seen}, @template, "r", "2026-07-09", "s", 20)
+  end
+
+  test "retired ids remain in seen (retire never resurrects repeats); no rotating kinds => never reshuffles" do
+    pool = bodies(3)
+    [a | _] = Enum.map(pool, & &1.id)
+    retired = Enum.map(pool, fn f -> if f.id == a, do: %{f | status: "retired"}, else: f end)
+    # a stays in seen even though retired; coverage counts the 2 LIVE bodies
+    {seen, false} = Core.commit(retired, @template, [a], [Enum.at(retired, 1).id], 20)
+    assert a in seen
+    # dressing-only template: commit is inert
+    assert {[], false} = Core.commit(pool, [%{kind: "body", rotate: false}], [], [], 20)
+  end
+
+  test "draw falls back when the live set shrank to fully-seen (retire race) — no error, avoids most recent" do
+    pool = bodies(3)
+    ids = Enum.map(pool, & &1.id)
+    {:ok, %{rotating_ids: [picked]}} =
+      Core.draw(pool, %{"r" => ids}, @template, "r", "2026-07-08", "s", 1)
+    refute picked == List.last(ids)
+  end
+end
