@@ -564,14 +564,17 @@ defmodule Genswarms.Cron do
               updated_at: now
           }
 
-        :none ->
+        no_next ->
+          # :none or {:error, reason} (poisoned stored expr): no next
+          # occurrence exists — terminal done, the schedule reason (if any)
+          # kept visible in last_error.
           %{
             job
             | state: "done",
               next_run_at: nil,
               claimed_due: nil,
               last_status: result.status,
-              last_error: nil,
+              last_error: schedule_error(no_next),
               updated_at: now
           }
       end
@@ -627,8 +630,13 @@ defmodule Genswarms.Cron do
         %{base | state: "paused", paused_by: "breaker", next_run_at: nil}
       else
         case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
-          {:ok, next} -> %{base | state: "active", next_run_at: next}
-          :none -> %{base | state: "failed", next_run_at: nil}
+          {:ok, next} ->
+            %{base | state: "active", next_run_at: next}
+
+          # :none or {:error, _}: no next occurrence — terminal failed; base
+          # already carries the (more proximate) delivery error in last_error.
+          _no_next ->
+            %{base | state: "failed", next_run_at: nil}
         end
       end
     else
@@ -643,6 +651,12 @@ defmodule Genswarms.Cron do
       }
     end
   end
+
+  # Schedule.next_after on a corrupt/poisoned stored schedule returns
+  # {:error, reason}; call sites treat it exactly like :none (no next
+  # occurrence). Where a job map is in hand this keeps the reason visible.
+  defp schedule_error(:none), do: nil
+  defp schedule_error({:error, reason}), do: "schedule error: #{reason}"
 
   defp retry_delay(job, attempts) do
     base = max(Map.get(job, :retry_backoff_ms, 60_000), 0)
@@ -720,7 +734,9 @@ defmodule Genswarms.Cron do
         "skip" ->
           case Schedule.next_after(job.schedule, job.last_run_at || job.created_at, now) do
             {:ok, next} -> %{job | next_run_at: next}
-            :none -> %{job | next_run_at: nil}
+            # :none or {:error, _}: nothing to arm — the caller's
+            # "job has no future run_at" reply surfaces it.
+            _no_next -> %{job | next_run_at: nil}
           end
 
         _coalesce ->
@@ -894,7 +910,10 @@ defmodule Genswarms.Cron do
           "skip" ->
             case Schedule.next_after(schedule, job.last_run_at || job.created_at, now) do
               {:ok, next} -> next
-              :none -> now
+              # :none or {:error, _} (poisoned stored expr): fall back to the
+              # coalesce recovery point instead of crashing init — the run's
+              # completion then parks the job terminal with the reason.
+              _no_next -> now
             end
 
           _coalesce ->

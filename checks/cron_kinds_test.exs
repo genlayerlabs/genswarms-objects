@@ -543,6 +543,40 @@ check.(
     job16b.next_run_at == base_now + 300_000
 )
 
+# ── Vector 17 (I3): poisoned stored cron expr must not crash completion — terminal, reason kept ──
+# A corrupt persisted row is the real ingress (create validates exprs); poisoning
+# the in-memory schedule after create reproduces it without a store harness.
+
+{state17, clock17, _sink17} = new_state.(base_now)
+
+{:reply, reply17, state17} = create.(state17, :ops, %{schedule: %{cron: "0 * * * *"}})
+job17_id = Jason.decode!(reply17)["job_id"]
+
+poisoned17 = %{
+  Map.fetch!(state17.jobs, job17_id)
+  | schedule: %{"kind" => "cron", "expr" => "garbage"}
+}
+
+state17 = %{state17 | jobs: Map.put(state17.jobs, job17_id, poisoned17)}
+set_clock.(clock17, base_now + 3_600_000)
+
+result17 =
+  try do
+    {:reply, _r, s} = tick.(state17, :ops)
+    {:ok, s}
+  rescue
+    e -> {:raise, e.__struct__}
+  end
+
+check.(
+  "poisoned cron expr on a due job: tick completes without raising, job goes terminal (removed from active set)",
+  match?({:ok, _}, result17) and
+    (case result17 do
+       {:ok, s} -> not Map.has_key?(s.jobs, job17_id)
+       _ -> false
+     end)
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do

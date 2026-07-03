@@ -286,6 +286,65 @@ check.(
   match?([%{"kind" => "run_at", "paused_by" => nil}], jobs7)
 )
 
+# ── Vector 8 (I3): poisoned store row (running + bad cron expr + misfire skip) must not crash boot ──
+# recover_running_job's skip branch hits Schedule.next_after on the corrupt expr;
+# a {:error, _} there used to CaseClauseError straight out of init (boot crash-loop).
+
+bad_expr_row = %{
+  id: 50,
+  state: "running",
+  data: %{
+    "id" => 50,
+    "name" => "poisoned",
+    "state" => "running",
+    "schedule" => %{"kind" => "cron", "expr" => "garbage"},
+    "misfire" => "skip",
+    "next_run_at" => nil,
+    "last_run_at" => base_now - 1_000,
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "created_at" => base_now - 10_000,
+    "updated_at" => base_now - 1_000
+  }
+}
+
+FakeStore.start([bad_expr_row])
+
+boot8 =
+  try do
+    {s, _c, _snk} = init_state.(base_now, [], %{store_mod: FakeStore})
+    {:ok, s}
+  rescue
+    e -> {:raise, e.__struct__}
+  end
+
+tick8 =
+  case boot8 do
+    {:ok, s} ->
+      try do
+        {:reply, _r, s2} = tick.(s, :ops)
+        {:ok, s2}
+      rescue
+        e -> {:raise, e.__struct__}
+      end
+
+    other ->
+      other
+  end
+
+row8 = Enum.find(FakeStore.load_cron_jobs(["done", "failed"]), &(&1.id == 50))
+
+check.(
+  "poisoned running+skip row: boot recovers without raising, tick completes, job lands terminal with last_error carrying the schedule reason",
+  match?({:ok, _}, boot8) and
+    match?({:ok, _}, tick8) and
+    (case tick8 do
+       {:ok, s2} -> not Map.has_key?(s2.jobs, 50)
+       _ -> false
+     end) and
+    row8 != nil and
+    String.contains?(row8.data["last_error"] || "", "cron")
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
