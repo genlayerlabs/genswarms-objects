@@ -1015,7 +1015,8 @@ defmodule Genswarms.Cron do
       case Schedule.next_after(job.schedule, due, now) do
         {:ok, next} -> %{job | next_run_at: next, updated_at: now}
         # :none or {:error, _}: nothing to arm — same shape as a skip resume.
-        _no_next -> %{job | next_run_at: nil, updated_at: now}
+        # Record the schedule error to prevent silent-park; observable via last_error.
+        _no_next -> %{job | next_run_at: nil, last_error: "schedule error: no next occurrence at load", updated_at: now}
       end
     else
       job

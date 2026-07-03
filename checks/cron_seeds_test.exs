@@ -423,6 +423,41 @@ check.(
     job10_skip_after.next_run_at == base_now + hour
 )
 
+# ── Vector 11 (I6): active skip job with poisoned cron expr at load records last_error (no silent-park) ──
+# When load_misfire finds no next occurrence (poisoned expr) for an overdue
+# skip-misfire job, it must record last_error to prevent silent parking.
+
+poisoned_skip_row = %{
+  id: 70,
+  state: "active",
+  data: %{
+    "id" => 70,
+    "name" => "poisoned skip",
+    "state" => "active",
+    "schedule" => %{"kind" => "cron", "expr" => "garbage"},
+    "misfire" => "skip",
+    "next_run_at" => base_now - 60_000,
+    "last_run_at" => base_now - 120_000,
+    "last_error" => nil,
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "created_at" => base_now - 10_000,
+    "updated_at" => base_now - 120_000
+  }
+}
+
+FakeStore.start([poisoned_skip_row])
+
+{state11, _clock11, _sink11} = init_state.(base_now, [], %{store_mod: FakeStore})
+job11_loaded = Map.get(state11.jobs, 70)
+
+check.(
+  "active skip job with poisoned expr loaded overdue: next_run_at == nil AND last_error contains 'schedule'",
+  job11_loaded != nil and
+    job11_loaded.next_run_at == nil and
+    is_binary(job11_loaded.last_error) and
+    String.contains?(job11_loaded.last_error, "schedule")
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
