@@ -159,7 +159,12 @@ defmodule Genswarms.Cron do
   defp create_job(from, msg, state) do
     now = state.now_fn.()
 
-    with {:ok, norm} <- Schedule.normalize(due_value(msg), now),
+    # validate_create_fields must run BEFORE existing_dedupe_job/build_job:
+    # both to_string message-derived fields, and a crafted map/list value
+    # would raise Protocol.UndefinedError on the engine's rescue-less cast
+    # path (ObjectServer crash). Reject, never coerce.
+    with :ok <- validate_create_fields(msg),
+         {:ok, norm} <- Schedule.normalize(due_value(msg), now),
          :ok <- check_floor(norm, state),
          :ok <- check_not_past(norm, now, state) do
       case existing_dedupe_job(state, msg["dedupe_key"]) do
@@ -201,6 +206,38 @@ defmodule Genswarms.Cron do
         {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
   end
+
+  # Inbound create_job fields that flow into to_string/safe_text must be
+  # scalar strings (or absent). Numbers/maps/lists are rejected with a clear
+  # error — silent coercion would mint surprising names/keys, and non-scalars
+  # would crash the object.
+  defp validate_create_fields(msg) do
+    cond do
+      not string_or_nil?(msg["target"]) ->
+        {:error, "target must be a string"}
+
+      not (is_nil(msg["message"]) or is_map(msg["message"])) ->
+        {:error, "message must be an object"}
+
+      is_map(msg["message"]) and not string_or_nil?(msg["message"]["action"]) ->
+        {:error, "message.action must be a string"}
+
+      not string_or_nil?(msg["name"]) ->
+        {:error, "name must be a string"}
+
+      not string_or_nil?(msg["dedupe_key"]) ->
+        {:error, "dedupe_key must be a string"}
+
+      not string_or_nil?(msg["misfire"]) ->
+        {:error, "misfire must be a string"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp string_or_nil?(nil), do: true
+  defp string_or_nil?(value), do: is_binary(value)
 
   defp existing_dedupe_job(_state, nil), do: nil
   defp existing_dedupe_job(_state, ""), do: nil

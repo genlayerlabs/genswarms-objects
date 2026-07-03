@@ -577,6 +577,51 @@ check.(
      end)
 )
 
+# ── Vector 18 (I6): crafted non-scalar string fields are rejected ok:false, never raise ──
+# Map/list values in to_string'd fields used to raise Protocol.UndefinedError;
+# the engine cast path has no rescue, so that was an ObjectServer crash.
+
+{state18a, _clock18a, _sink18a} = new_state.(base_now)
+
+bad18 = [
+  {"map target", %{target: %{"a" => 1}}},
+  {"list target", %{target: ["proactive"]}},
+  {"map message.action", %{message: %{"action" => %{"a" => 1}}}},
+  {"list message (non-object)", %{message: ["run"]}},
+  {"map name", %{name: %{"a" => 1}}},
+  {"map dedupe_key", %{dedupe_key: %{"a" => 1}}},
+  {"list misfire", %{misfire: ["skip"]}}
+]
+
+results18 =
+  for {label, extra} <- bad18 do
+    outcome =
+      try do
+        case create.(state18a, :ops, Map.merge(%{schedule: %{every_ms: 300_000}}, extra)) do
+          {:reply, r, _s} -> Jason.decode!(r)["ok"]
+          {:noreply, _s} -> :noreply
+        end
+      rescue
+        e -> {:raise, e.__struct__}
+      end
+
+    {label, outcome}
+  end
+
+check.(
+  "crafted non-scalar create_job fields (target/message.action/name/dedupe_key/misfire) all reject ok:false without raising",
+  Enum.all?(results18, fn {_label, outcome} -> outcome == false end)
+)
+
+# valid create still works after validation was added (no over-rejection)
+{:reply, reply18ok, _state18a} =
+  create.(state18a, :ops, %{schedule: %{every_ms: 300_000}, name: "fine", dedupe_key: "dk18", misfire: "skip"})
+
+check.(
+  "valid scalar fields still accepted after input validation",
+  Jason.decode!(reply18ok)["ok"] == true
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
