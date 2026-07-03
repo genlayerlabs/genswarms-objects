@@ -627,17 +627,25 @@ defmodule Genswarms.Cron do
       {:reply, Jason.encode!(%{ok: false, error: "job terminal", job_id: id, state: state_name}),
        state}
 
+  # F2: run_now bypassing max_concurrency would let a trusted caller launch
+  # unbounded concurrent tasks regardless of the configured cap. At
+  # saturation, reject rather than defer — run_now is an immediate-fire
+  # request, not a schedulable one; there is no due-queue to defer it onto.
   defp run_now_existing_job(id, %{state: "active"} = job, state) do
-    now = state.now_fn.()
-    state = launch_job(job, state, now, now) |> arm_timer(now)
+    if map_size(state.tasks) >= state.max_concurrency do
+      {:reply, Jason.encode!(%{ok: false, error: "at max concurrency", job_id: id}), state}
+    else
+      now = state.now_fn.()
+      state = launch_job(job, state, now, now) |> arm_timer(now)
 
-    {:reply,
-     Jason.encode!(%{
-       ok: true,
-       job_id: id,
-       launched: 1,
-       running: map_size(state.tasks)
-     }), state}
+      {:reply,
+       Jason.encode!(%{
+         ok: true,
+         job_id: id,
+         launched: 1,
+         running: map_size(state.tasks)
+       }), state}
+    end
   end
 
   defp run_now_existing_job(id, %{state: state_name}, state),
