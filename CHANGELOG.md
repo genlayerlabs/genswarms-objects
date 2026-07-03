@@ -13,7 +13,7 @@ versions do not track them 1:1.
 
 ## cron (`packages/cron`, module `Genswarms.Cron`)
 
-### 0.2.2 — unreleased (branch `feat/cron-0.2.2`, not yet tagged/published)
+### 0.2.2 — repo tag `v0.1.6` (2026-07-03, branch `feat/cron-0.2.2`)
 
 Absorbs the architecture review (`cron-arch-review.md`) and the audit's
 previously-deferred findings. No public-contract break; every existing
@@ -59,11 +59,25 @@ vector stays green.
   - Minor: dead `field/3` branch removed, the search-window comment
     corrected to "1831 days", a direct vector added for the exact-`now`
     schedule boundary (audit I5).
-- **Wave 3 (this — docs only):** store seam contract section, honest
+- **Wave 3 (docs only):** store seam contract section, honest
   delivery paragraph, create-envelope documentation, this changelog, the
   README versioning-wording fix, a `Genswarms.Cron.Store` doc-only
   behaviour module, and the vixie `*/n` non-star-base note in
   `cron_expr.ex`.
+- **Review fix pass (post whole-branch review):**
+  - Non-boolean `once` is rejected (`once must be a boolean`) instead of
+    silently degrading to live-only dedupe; `once: true`'s `store_mod`
+    dependency is documented (memory-only wiring degrades to live-only).
+  - `run_now` respects `max_concurrency` — at saturation it replies
+    `{ok:false,error:"at max concurrency"}` instead of stacking tasks.
+  - Schedule/floor/payload validation now runs **before** the once-terminal
+    dedupe lookup, so a garbage schedule is rejected rather than masked by
+    `deduped: true`; only the past-guard is skipped on a dedupe hit.
+  - Vector 5b advances the clock before `run_now` so re-arm-anchor
+    regressions are detectable; documented that `run_now` permanently
+    re-phases `every_ms` jobs while cron-kind jobs stay on their absolute
+    grid; documented `origin`. All fix-pass behaviors pinned by permanent
+    vectors (negative-checked against the pre-fix code).
 
 ### 0.2.1 — repo tag `v0.1.5` (2026-07-03, PR #5 `fix/cron-audit-hardening`)
 
