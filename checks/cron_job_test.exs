@@ -70,6 +70,15 @@ defmodule CronJobClaimTest do
     assert claimed.claimed_due == 5_000
     assert claimed.attempts == 2
   end
+
+  test "claim/3 can claim an immediate run_now occurrence without using the future scheduled due" do
+    job = base_job(%{schedule: every_5s(), next_run_at: 6_000, claimed_due: nil})
+    claimed = Job.claim(job, 1_000, 1_000)
+
+    assert claimed.state == "running"
+    assert claimed.claimed_due == 1_000
+    assert claimed.next_run_at == nil
+  end
 end
 
 defmodule CronJobCompleteHappyPathTest do
@@ -114,6 +123,22 @@ defmodule CronJobCompleteHappyPathTest do
     assert active.attempts == 0
     assert active.consecutive_failures == 0
     assert active.last_error == nil
+  end
+
+  test "complete/3 after run_now re-arms from the immediate fired occurrence, not the old future due" do
+    job =
+      base_job(%{
+        state: "running",
+        schedule: every_5s(),
+        claimed_due: 1_000,
+        next_run_at: nil,
+        attempts: 1
+      })
+
+    active = Job.complete(job, %{status: "ok", error: nil}, 1_000)
+
+    assert active.state == "active"
+    assert active.next_run_at == 6_000
   end
 end
 
@@ -297,6 +322,28 @@ defmodule CronJobFinishPauseTest do
     assert finished.next_run_at == nil
   end
 
+  test "finish/3 preserves a pause after an error result and records last_error" do
+    job =
+      base_job(%{
+        state: "paused",
+        paused_by: "operator",
+        schedule: every_5s(),
+        claimed_due: 1_000,
+        attempts: 1,
+        next_run_at: nil
+      })
+
+    finished = Job.finish(job, %{status: "error", error: "boom"}, 1_050)
+
+    assert finished.state == "paused"
+    assert finished.paused_by == "operator"
+    assert finished.claimed_due == nil
+    assert finished.attempts == 0
+    assert finished.last_status == "error"
+    assert finished.last_error == "boom"
+    assert finished.next_run_at == nil
+  end
+
   test "finish/3 dispatches a non-paused job through complete/3" do
     job =
       base_job(%{
@@ -351,6 +398,26 @@ defmodule CronJobResumeTest do
 
     # grid from last_run_at (1000), step 5000: ...,6000,11000,... — smallest strictly after 9000 is 11000
     assert resumed.next_run_at == 11_000
+  end
+
+  test "resume/2 with misfire \"skip\" and no next occurrence leaves next_run_at nil" do
+    job =
+      base_job(%{
+        state: "paused",
+        paused_by: "breaker",
+        schedule: unsatisfiable_cron(),
+        misfire: "skip",
+        next_run_at: nil,
+        last_run_at: 1_000,
+        created_at: 0
+      })
+
+    resumed = Job.resume(job, 9_000)
+
+    assert resumed.state == "active"
+    assert resumed.next_run_at == nil
+    assert resumed.paused_by == nil
+    assert resumed.consecutive_failures == 0
   end
 
   test "resume/2 leaves a still-future next_run_at alone (resuming early shouldn't fire early)" do

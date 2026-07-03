@@ -16,7 +16,9 @@ check = fn name, cond ->
   end
 end
 
-IO.puts("\n══ Cron object: schedule kinds (create validation, claimed due, recurring re-arm) ══\n")
+IO.puts(
+  "\n══ Cron object: schedule kinds (create validation, claimed due, recurring re-arm) ══\n"
+)
 
 ms = fn iso ->
   {:ok, dt, _} = DateTime.from_iso8601(iso)
@@ -82,12 +84,34 @@ new_state_toggle = fn now, fail_agent ->
 end
 
 create = fn state, from, extra ->
-  msg = Map.merge(%{action: "create_job", target: "proactive", message: %{"action" => "run"}}, extra)
+  msg =
+    Map.merge(%{action: "create_job", target: "proactive", message: %{"action" => "run"}}, extra)
+
   Cron.handle_message(from, Jason.encode!(msg), state)
 end
 
 tick = fn state, from ->
   Cron.handle_message(from, Jason.encode!(%{action: "tick"}), state)
+end
+
+run_now = fn state, from, id ->
+  Cron.handle_message(from, Jason.encode!(%{action: "run_now", job_id: id}), state)
+end
+
+defmodule CronKindsEventSink do
+  def start do
+    if Process.whereis(__MODULE__) do
+      Agent.update(__MODULE__, fn _ -> [] end)
+    else
+      Agent.start_link(fn -> [] end, name: __MODULE__)
+    end
+  end
+
+  def object(object, type, message, opts) do
+    Agent.update(__MODULE__, &[{object, type, message, opts} | &1])
+  end
+
+  def events, do: Agent.get(__MODULE__, &Enum.reverse/1)
 end
 
 # ── Vector 1: every_ms create — first-fire rule (next_run_at == now + period) ──
@@ -180,6 +204,59 @@ check.(
     job5_after.attempts == 0
 )
 
+# ── Vector 5b: run_now fires an active recurring job immediately and re-arms from that occurrence ──
+
+{state5b, _clock5b, sink5b} = new_state.(base_now)
+
+{:reply, reply5b, state5b} = create.(state5b, :ops, %{schedule: %{every_ms: 300_000}})
+job5b_id = Jason.decode!(reply5b)["job_id"]
+
+{:reply, run5b_reply, state5b} = run_now.(state5b, :ops, "#{job5b_id}")
+decoded_run5b = Jason.decode!(run5b_reply)
+job5b_after = Map.fetch!(state5b.jobs, job5b_id)
+
+check.(
+  "run_now on an ACTIVE recurring job: trusted call delivers once now and next_run_at remains on the immediate occurrence's grid",
+  decoded_run5b["ok"] == true and
+    decoded_run5b["launched"] == 1 and
+    sink_messages.(sink5b) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
+    job5b_after.state == "active" and
+    job5b_after.next_run_at == base_now + 300_000
+)
+
+# ── Vector 5c: run_now rejects paused/terminal jobs and silently drops untrusted senders ──
+
+{state5c, clock5c, sink5c} = new_state.(base_now)
+
+{:reply, reply5c, state5c} = create.(state5c, :ops, %{schedule: %{every_ms: 300_000}})
+job5c_id = Jason.decode!(reply5c)["job_id"]
+
+{:reply, _pause5c, state5c} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "pause", job_id: job5c_id}), state5c)
+
+{:reply, paused5c_reply, state5c} = run_now.(state5c, :ops, job5c_id)
+
+{:reply, _delete5c, state5c} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "delete", job_id: job5c_id}), state5c)
+
+{:reply, terminal5c_reply, state5c} = run_now.(state5c, :ops, job5c_id)
+
+{:reply, reply5c2, state5c} = create.(state5c, :ops, %{schedule: %{every_ms: 300_000}})
+job5c2_id = Jason.decode!(reply5c2)["job_id"]
+
+{:noreply, state5c_after_untrusted} = run_now.(state5c, :agent_0, job5c2_id)
+set_clock.(clock5c, base_now + 1_000)
+
+check.(
+  "run_now rejects paused/terminal jobs and untrusted run_now is a silent no-op",
+  Jason.decode!(paused5c_reply)["ok"] == false and
+    Jason.decode!(paused5c_reply)["state"] == "paused" and
+    Jason.decode!(terminal5c_reply)["ok"] == false and
+    Jason.decode!(terminal5c_reply)["error"] == "job not found" and
+    state5c_after_untrusted == state5c and
+    sink_messages.(sink5c) == []
+)
+
 # ── Vector 6: downtime catch-up — exactly one delivery, next is the strictly-future grid point ──
 
 set_clock.(clock5, base_now + 1_650_000)
@@ -216,6 +293,22 @@ list7 = Jason.decode!(list7_reply)["jobs"]
 check.(
   "one-shot completes to done exactly as 0.1.1: job removed from active set, list shows no non-terminal job",
   not Map.has_key?(state7.jobs, job7_id) and list7 == []
+)
+
+# ── Vector 7b (W2 M7): timer tick path is noreply while message tick still replies ──
+
+{state7b, clock7b, sink7b} = new_state.(base_now)
+
+{:reply, reply7b, state7b} = create.(state7b, :ops, %{run_at: base_now + 60_000})
+job7b_id = Jason.decode!(reply7b)["job_id"]
+
+set_clock.(clock7b, base_now + 60_000)
+{:noreply, state7b} = Cron.handle_info(:tick, state7b)
+
+check.(
+  "handle_info(:tick) returns noreply and still runs due jobs through the shared tick core",
+  not Map.has_key?(state7b.jobs, job7b_id) and
+    sink_messages.(sink7b) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}]
 )
 
 # ── Vector 8: recurring occurrence exhaustion → active, consecutive_failures 1, grid next ──
@@ -283,6 +376,53 @@ check.(
   job9_mid.state == "active" and job9_mid.consecutive_failures == 1 and
     job9_after.state == "paused" and job9_after.paused_by == "breaker" and
     job9_after.consecutive_failures == 2 and job9_after.next_run_at == nil
+)
+
+# ── Vector 9b (W2): run failures and breaker pauses emit events through events_mod ──
+
+CronKindsEventSink.start()
+{:ok, clock9b} = Agent.start_link(fn -> base_now end)
+
+{:ok, state9b} =
+  Cron.init(%{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: false,
+    async?: false,
+    now_fn: fn -> Agent.get(clock9b, & &1) end,
+    deliver_fn: fn _target, _from, _json -> {:error, "boom"} end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000,
+    max_attempts: 1,
+    breaker_threshold: 1,
+    events_mod: CronKindsEventSink
+  })
+
+{:reply, reply9b, state9b} =
+  create.(state9b, :ops, %{schedule: %{every_ms: 300_000}, name: "eventful"})
+
+job9b_id = Jason.decode!(reply9b)["job_id"]
+
+set_clock.(clock9b, base_now + 300_000)
+{:reply, _tick9b, state9b} = tick.(state9b, :ops)
+
+job9b_after = Map.fetch!(state9b.jobs, job9b_id)
+events9b = CronKindsEventSink.events()
+
+failure9b =
+  Enum.find(events9b, fn {_object, type, _message, _opts} -> type == :job_run_failed end)
+
+breaker9b =
+  Enum.find(events9b, fn {_object, type, _message, _opts} -> type == :job_breaker_paused end)
+
+check.(
+  "run failure and breaker pause emit events with job name and consecutive_failures metadata",
+  job9b_after.state == "paused" and
+    match?({:cron, :job_run_failed, _, _}, failure9b) and
+    match?({:cron, :job_breaker_paused, _, _}, breaker9b) and
+    get_in(elem(failure9b, 3), [:metadata, :name]) == "eventful" and
+    get_in(elem(breaker9b, 3), [:metadata, :consecutive_failures]) == 1
 )
 
 # ── Vector 10: resume on a breaker-paused job clears the breaker and coalesce-arms now ──
@@ -543,6 +683,99 @@ check.(
     job16b.next_run_at == base_now + 300_000
 )
 
+# ── Vector 16c (W2 Audit M1): saturation re-arms the timer with a floor, not 0ms ──
+
+{:ok, clock16c} = Agent.start_link(fn -> base_now end)
+{:ok, sink16c} = Agent.start_link(fn -> [] end)
+
+{:ok, state16c} =
+  Cron.init(%{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: true,
+    tick_ms: 10_000,
+    async?: true,
+    max_concurrency: 1,
+    now_fn: fn -> Agent.get(clock16c, & &1) end,
+    deliver_fn: fn target, from, json ->
+      Process.sleep(100)
+      Agent.update(sink16c, &[{target, from, json} | &1])
+      :ok
+    end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000
+  })
+
+{:reply, _reply16c_a, state16c} = create.(state16c, :ops, %{run_at: base_now + 60_000})
+{:reply, _reply16c_b, state16c} = create.(state16c, :ops, %{run_at: base_now + 60_000})
+
+set_clock.(clock16c, base_now + 60_000)
+{:reply, tick16c_a, state16c} = tick.(state16c, :ops)
+{:reply, tick16c_b, state16c} = tick.(state16c, :ops)
+timer16c_delay = Process.read_timer(state16c.timer_ref)
+
+state16c = drain_task.(state16c)
+
+check.(
+  "when all task slots are busy, a deferred due job re-arms at tick_ms instead of busy-spinning at 0ms",
+  Jason.decode!(tick16c_a)["launched"] == 1 and
+    Jason.decode!(tick16c_b)["launched"] == 0 and
+    Jason.decode!(tick16c_b)["deferred"] == 1 and
+    is_integer(timer16c_delay) and
+    timer16c_delay > 100 and
+    map_size(state16c.tasks) == 0
+)
+
+# ── Vector 16d (W2 Audit M3): linked task exits are trapped and handled through :DOWN ──
+
+{:ok, clock16d} = Agent.start_link(fn -> base_now end)
+
+{:ok, state16d} =
+  Cron.init(%{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: false,
+    async?: true,
+    now_fn: fn -> Agent.get(clock16d, & &1) end,
+    deliver_fn: fn _target, _from, _json -> exit(:boom) end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000,
+    retry_backoff_ms: 1_000
+  })
+
+{:reply, reply16d, state16d} = create.(state16d, :ops, %{run_at: base_now + 60_000})
+job16d_id = Jason.decode!(reply16d)["job_id"]
+
+set_clock.(clock16d, base_now + 60_000)
+{:reply, _tick16d, state16d} = tick.(state16d, :ops)
+
+down16d =
+  receive do
+    {:DOWN, _ref, :process, _pid, _reason} = down ->
+      down
+
+    {:EXIT, _pid, _reason} ->
+      receive do
+        {:DOWN, _ref, :process, _pid, _reason} = down -> down
+      after
+        2_000 -> raise "async down vector: no :DOWN after :EXIT"
+      end
+  after
+    2_000 -> raise "async down vector: no task down arrived"
+  end
+
+{:noreply, state16d} = Cron.handle_info(down16d, state16d)
+job16d = Map.fetch!(state16d.jobs, job16d_id)
+
+check.(
+  "Task.async exits no longer kill the scheduler process; :DOWN records a retryable run failure",
+  job16d.state == "active" and
+    job16d.last_status == "error" and
+    String.contains?(job16d.last_error || "", "task down")
+)
+
 # ── Vector 17 (I3): poisoned stored cron expr must not crash completion — terminal, reason kept ──
 # A corrupt persisted row is the real ingress (create validates exprs); poisoning
 # the in-memory schedule after create reproduces it without a store harness.
@@ -571,10 +804,10 @@ result17 =
 check.(
   "poisoned cron expr on a due job: tick completes without raising, job goes terminal (removed from active set)",
   match?({:ok, _}, result17) and
-    (case result17 do
-       {:ok, s} -> not Map.has_key?(s.jobs, job17_id)
-       _ -> false
-     end)
+    case result17 do
+      {:ok, s} -> not Map.has_key?(s.jobs, job17_id)
+      _ -> false
+    end
 )
 
 # ── Vector 18 (I6): crafted non-scalar string fields are rejected ok:false, never raise ──
@@ -615,11 +848,64 @@ check.(
 
 # valid create still works after validation was added (no over-rejection)
 {:reply, reply18ok, _state18a} =
-  create.(state18a, :ops, %{schedule: %{every_ms: 300_000}, name: "fine", dedupe_key: "dk18", misfire: "skip"})
+  create.(state18a, :ops, %{
+    schedule: %{every_ms: 300_000},
+    name: "fine",
+    dedupe_key: "dk18",
+    misfire: "skip"
+  })
 
 check.(
   "valid scalar fields still accepted after input validation",
   Jason.decode!(reply18ok)["ok"] == true
+)
+
+# ── Vector 19 (W2 M2): origin is free-form scalar provenance and context_from is gone ──
+
+{state19, _clock19, _sink19} = new_state.(base_now)
+
+{:reply, reply19, state19} =
+  create.(state19, :ops, %{
+    schedule: %{every_ms: 300_000},
+    origin: %{
+      "campaign_id" => "c1",
+      "score" => 7,
+      "enabled" => true,
+      "nested" => %{"drop" => true}
+    },
+    context_from: [1, 2, 3]
+  })
+
+job19 = Map.fetch!(state19.jobs, Jason.decode!(reply19)["job_id"])
+
+check.(
+  "origin keeps arbitrary scalar keys, drops non-scalars, and context_from is no longer persisted",
+  job19.origin == %{
+    "campaign_id" => "c1",
+    "score" => 7,
+    "enabled" => true,
+    "source" => "ops"
+  } and
+    not Map.has_key?(job19, :context_from)
+)
+
+# ── Vector 20 (W2 Arch M-6): string allowed_targets fail with a descriptive boot abort ──
+
+allowed_target_error20 =
+  try do
+    Cron.init(%{
+      auto_tick: false,
+      allowed_targets: %{"cron_unknown_target_for_w2" => ["run"]}
+    })
+
+    nil
+  rescue
+    e in ArgumentError -> Exception.message(e)
+  end
+
+check.(
+  "unknown string allowed_targets raise a descriptive ArgumentError instead of raw to_existing_atom failure",
+  allowed_target_error20 == "cron allowed_targets: unknown object :cron_unknown_target_for_w2"
 )
 
 failures = Agent.get(fails, &Enum.reverse/1)

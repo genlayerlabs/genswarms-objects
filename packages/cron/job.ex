@@ -36,6 +36,15 @@ defmodule Genswarms.Cron.Job do
   time. Cleared on success/exhaustion by `finish/3`.
   """
   def claim(job, now) do
+    claim(job, now, job.next_run_at)
+  end
+
+  @doc """
+  Claim a specific occurrence. The cron shell uses this for `run_now`, where
+  the fired occurrence is `now` even if the job's scheduled `next_run_at` was
+  in the future. Retry claims still keep an existing `claimed_due`.
+  """
+  def claim(job, now, occurrence_due) do
     %{
       job
       | last_run_at: now,
@@ -44,7 +53,7 @@ defmodule Genswarms.Cron.Job do
         # true due point — keep the original due (set at the first claim of this
         # occurrence) alive across retry cycles so a later success re-arms off the
         # grid, not off the backoff time. Cleared on success/exhaustion (finish/3).
-        claimed_due: job.claimed_due || job.next_run_at,
+        claimed_due: job.claimed_due || occurrence_due,
         state: "running",
         attempts: Map.get(job, :attempts, 0) + 1,
         updated_at: now

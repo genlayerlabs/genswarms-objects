@@ -112,6 +112,55 @@ check.(
     cron_dedupe_2["job_id"] == cron_dedupe_1["job_id"] and map_size(cron_state.jobs) == 2
 )
 
+interface_actions = Cron.interface() |> Map.keys() |> Enum.sort()
+
+check.(
+  "cron interface declares every public action including run_now with neutral examples",
+  interface_actions == [:create_job, :delete, :list, :pause, :resume, :run_now, :status, :tick] and
+    String.contains?(Cron.interface().create_job.input, "\"target\":\"reporter\"") and
+    String.contains?(Cron.interface().run_now.input, "\"action\":\"run_now\"")
+)
+
+{:reply, unknown_trusted_reply, _cron_state_after_unknown} =
+  Cron.handle_message(:tg_ingress, Jason.encode!(%{action: "typo"}), cron_state)
+
+{:noreply, _cron_state_after_untrusted_unknown} =
+  Cron.handle_message(:agent_0, Jason.encode!(%{action: "typo"}), cron_state)
+
+check.(
+  "trusted decoded unknown actions reply unknown_action; untrusted unknown actions stay silent",
+  Jason.decode!(unknown_trusted_reply) == %{"ok" => false, "error" => "unknown_action"}
+)
+
+{:ok, cap_state} =
+  Cron.init(%{
+    name: :cron,
+    swarm_name: "test",
+    auto_tick: false,
+    async?: false,
+    max_message_bytes: 120,
+    now_fn: fn -> Agent.get(cron_clock, & &1) end,
+    deliver_fn: cron_deliver,
+    trusted_sources: [:tg_ingress],
+    allowed_targets: %{test_sink: ["do_work"]}
+  })
+
+oversized_create =
+  Jason.encode!(%{
+    action: "create_job",
+    run_at: cron_now,
+    target: "test_sink",
+    message: %{"action" => "do_work", "blob" => String.duplicate("x", 200)}
+  })
+
+{:reply, oversized_reply, _cap_state} =
+  Cron.handle_message(:tg_ingress, oversized_create, cap_state)
+
+check.(
+  "oversized trusted create_job payloads are rejected ok:false before decode/work",
+  Jason.decode!(oversized_reply) == %{"ok" => false, "error" => "message_too_large"}
+)
+
 {:reply, cron_tick_reply, cron_state} =
   Cron.handle_message(:tg_ingress, Jason.encode!(%{action: "tick"}), cron_state)
 

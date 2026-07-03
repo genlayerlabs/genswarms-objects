@@ -38,11 +38,15 @@ defmodule FakeStore do
   # returns only rows whose state is in the list.
   def load_cron_jobs(states),
     do: Agent.get(__MODULE__, & &1) |> Enum.filter(&(&1.state in states))
+
   def max_cron_job_id, do: Agent.get(__MODULE__, &Enum.reduce(&1, 0, fn r, m -> max(r.id, m) end))
 
   def save_cron_job(job) do
     Agent.update(__MODULE__, fn rows ->
-      [%{id: job.id, state: job.state, data: json_roundtrip(job)} | Enum.reject(rows, &(&1.id == job.id))]
+      [
+        %{id: job.id, state: job.state, data: json_roundtrip(job)}
+        | Enum.reject(rows, &(&1.id == job.id))
+      ]
     end)
   end
 
@@ -84,7 +88,9 @@ list = fn state, from ->
 end
 
 create = fn state, from, extra ->
-  msg = Map.merge(%{action: "create_job", target: "proactive", message: %{"action" => "run"}}, extra)
+  msg =
+    Map.merge(%{action: "create_job", target: "proactive", message: %{"action" => "run"}}, extra)
+
   Cron.handle_message(from, Jason.encode!(msg), state)
 end
 
@@ -97,8 +103,20 @@ end
 FakeStore.start([])
 
 seeds_a = [
-  %{name: "digest", dedupe_key: "seed:digest", schedule: %{every_ms: 300_000}, target: "proactive", message: %{"action" => "run"}},
-  %{name: "hourly", dedupe_key: "seed:hourly", schedule: %{cron: "0 * * * *"}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "digest",
+    dedupe_key: "seed:digest",
+    schedule: %{every_ms: 300_000},
+    target: "proactive",
+    message: %{"action" => "run"}
+  },
+  %{
+    name: "hourly",
+    dedupe_key: "seed:hourly",
+    schedule: %{cron: "0 * * * *"},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 {state1, _clock1, _sink1} = init_state.(base_now, seeds_a, %{store_mod: FakeStore})
@@ -139,8 +157,20 @@ check.(
 now3 = base_now + 200_000
 
 seeds_b = [
-  %{name: "digest", dedupe_key: "seed:digest", schedule: %{every_ms: 600_000}, target: "proactive", message: %{"action" => "run"}},
-  %{name: "hourly", dedupe_key: "seed:hourly", schedule: %{cron: "0 * * * *"}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "digest",
+    dedupe_key: "seed:digest",
+    schedule: %{every_ms: 600_000},
+    target: "proactive",
+    message: %{"action" => "run"}
+  },
+  %{
+    name: "hourly",
+    dedupe_key: "seed:hourly",
+    schedule: %{cron: "0 * * * *"},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 {state3, _clock3, _sink3} = init_state.(now3, seeds_b, %{store_mod: FakeStore})
@@ -160,7 +190,13 @@ check.(
 FakeStore.start([])
 
 bad_target_seeds = [
-  %{name: "bad-target-seed", dedupe_key: "seed:bad-target", schedule: %{every_ms: 300_000}, target: "nope", message: %{"action" => "run"}}
+  %{
+    name: "bad-target-seed",
+    dedupe_key: "seed:bad-target",
+    schedule: %{every_ms: 300_000},
+    target: "nope",
+    message: %{"action" => "run"}
+  }
 ]
 
 bad_target_error =
@@ -174,7 +210,12 @@ bad_target_error =
 FakeStore.start([])
 
 missing_dedupe_seeds = [
-  %{name: "missing-dedupe-seed", schedule: %{every_ms: 300_000}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "missing-dedupe-seed",
+    schedule: %{every_ms: 300_000},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 missing_dedupe_error =
@@ -188,7 +229,13 @@ missing_dedupe_error =
 FakeStore.start([])
 
 unsatisfiable_seeds = [
-  %{name: "unsatisfiable-seed", dedupe_key: "seed:unsatisfiable", schedule: %{cron: "0 0 30 2 *"}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "unsatisfiable-seed",
+    dedupe_key: "seed:unsatisfiable",
+    schedule: %{cron: "0 0 30 2 *"},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 unsatisfiable_error =
@@ -202,7 +249,8 @@ unsatisfiable_error =
 check.(
   "invalid seeds raise ArgumentError naming the seed: bad target, missing dedupe_key, unsatisfiable cron",
   is_binary(bad_target_error) and String.contains?(bad_target_error, "bad-target-seed") and
-    is_binary(missing_dedupe_error) and String.contains?(missing_dedupe_error, "missing-dedupe-seed") and
+    is_binary(missing_dedupe_error) and
+    String.contains?(missing_dedupe_error, "missing-dedupe-seed") and
     is_binary(unsatisfiable_error) and String.contains?(unsatisfiable_error, "unsatisfiable-seed")
 )
 
@@ -211,13 +259,21 @@ check.(
 FakeStore.start([])
 
 seeds_c = [
-  %{name: "digest", dedupe_key: "seed:digest", schedule: %{every_ms: 300_000}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "digest",
+    dedupe_key: "seed:digest",
+    schedule: %{every_ms: 300_000},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 {state5, _clock5, _sink5} = init_state.(base_now, seeds_c, %{store_mod: FakeStore})
 seed5_job = Enum.find(Map.values(state5.jobs), &(&1.dedupe_key == "seed:digest"))
 
-{:reply, reply5, state5} = create.(state5, :ops, %{dedupe_key: "seed:digest", schedule: %{every_ms: 300_000}})
+{:reply, reply5, state5} =
+  create.(state5, :ops, %{dedupe_key: "seed:digest", schedule: %{every_ms: 300_000}})
+
 decoded5 = Jason.decode!(reply5)
 
 check.(
@@ -281,12 +337,25 @@ check.(
 FakeStore.start([])
 
 {state7, _clock7, _sink7} = init_state.(base_now, [], %{store_mod: FakeStore})
-{:reply, _create7, state7} = create.(state7, :ops, %{run_at: base_now + 60_000})
+
+{:reply, _create7, state7} =
+  create.(state7, :ops, %{run_at: base_now + 60_000, dedupe_key: "list:shape"})
+
 jobs7 = list.(state7, :ops)
 
 check.(
-  "list rows carry kind and paused_by keys",
-  match?([%{"kind" => "run_at", "paused_by" => nil}], jobs7)
+  "list rows carry kind, paused_by, schedule, and dedupe_key keys",
+  match?(
+    [
+      %{
+        "kind" => "run_at",
+        "paused_by" => nil,
+        "schedule" => %{"kind" => "run_at", "run_at_ms" => _},
+        "dedupe_key" => "list:shape"
+      }
+    ],
+    jobs7
+  )
 )
 
 # ── Vector 8 (I3): poisoned store row (running + bad cron expr + misfire skip) must not crash boot ──
@@ -340,10 +409,10 @@ check.(
   "poisoned running+skip row: boot recovers without raising, tick completes, job lands terminal with last_error carrying the schedule reason",
   match?({:ok, _}, boot8) and
     match?({:ok, _}, tick8) and
-    (case tick8 do
-       {:ok, s2} -> not Map.has_key?(s2.jobs, 50)
-       _ -> false
-     end) and
+    case tick8 do
+      {:ok, s2} -> not Map.has_key?(s2.jobs, 50)
+      _ -> false
+    end and
     row8 != nil and
     String.contains?(row8.data["last_error"] || "", "cron")
 )
@@ -355,7 +424,13 @@ check.(
 FakeStore.start([])
 
 oneshot_seeds = [
-  %{name: "once", dedupe_key: "seed:once", schedule: %{"run_at" => base_now - 3_600_000}, target: "proactive", message: %{"action" => "run"}}
+  %{
+    name: "once",
+    dedupe_key: "seed:once",
+    schedule: %{"run_at" => base_now - 3_600_000},
+    target: "proactive",
+    message: %{"action" => "run"}
+  }
 ]
 
 {state9a, _clock9a, sink9a} = init_state.(base_now, oneshot_seeds, %{store_mod: FakeStore})
@@ -363,7 +438,9 @@ oneshot_seeds = [
 deliveries9_boot1 = length(Agent.get(sink9a, & &1))
 rows9_boot1 = Agent.get(FakeStore, & &1)
 
-{state9b, _clock9b, sink9b} = init_state.(base_now + 60_000, oneshot_seeds, %{store_mod: FakeStore})
+{state9b, _clock9b, sink9b} =
+  init_state.(base_now + 60_000, oneshot_seeds, %{store_mod: FakeStore})
+
 {:reply, _tick9b, _state9b} = tick.(state9b, :ops)
 deliveries9_boot2 = length(Agent.get(sink9b, & &1))
 rows9_boot2 = Agent.get(FakeStore, & &1)
@@ -375,6 +452,52 @@ check.(
     deliveries9_boot2 == 0 and
     map_size(state9b.jobs) == 0 and
     length(rows9_boot2) == 1
+)
+
+# ── Vector 9b (W2 I4): runtime create_job once=true consults terminal rows by dedupe_key ──
+
+FakeStore.start([])
+
+{state9c, _clock9c, sink9c} = init_state.(base_now, [], %{store_mod: FakeStore})
+
+{:reply, reply9c_create, state9c} =
+  create.(state9c, :ops, %{
+    run_at: base_now,
+    dedupe_key: "runtime:once",
+    once: true
+  })
+
+job9c_id = Jason.decode!(reply9c_create)["job_id"]
+{:reply, _tick9c, state9c} = tick.(state9c, :ops)
+
+{:reply, reply9c_once, state9c} =
+  create.(state9c, :ops, %{
+    run_at: base_now - 120_000,
+    dedupe_key: "runtime:once",
+    once: true
+  })
+
+decoded9c_once = Jason.decode!(reply9c_once)
+
+{:reply, reply9c_default, state9c_default} =
+  create.(state9c, :ops, %{
+    run_at: base_now + 60_000,
+    dedupe_key: "runtime:once"
+  })
+
+decoded9c_default = Jason.decode!(reply9c_default)
+
+check.(
+  "runtime once=true dedupes against terminal rows; once absent keeps the existing live-only behavior",
+  length(Agent.get(sink9c, & &1)) == 1 and
+    decoded9c_once["ok"] == true and
+    decoded9c_once["deduped"] == true and
+    decoded9c_once["job_id"] == job9c_id and
+    decoded9c_once["state"] == "done" and
+    map_size(state9c.jobs) == 0 and
+    decoded9c_default["ok"] == true and
+    decoded9c_default["deduped"] != true and
+    map_size(state9c_default.jobs) == 1
 )
 
 # ── Vector 10 (I5): misfire "skip" honored on ORDINARY downtime (active row loaded overdue) ──
@@ -456,6 +579,44 @@ check.(
     job11_loaded.next_run_at == nil and
     is_binary(job11_loaded.last_error) and
     String.contains?(job11_loaded.last_error, "schedule")
+)
+
+# ── Vector 12 (W2 M6/Audit M6): string persisted ids and message job_ids are coerced strictly ──
+
+string_id_row = %{
+  id: "9",
+  state: "active",
+  data: %{
+    "id" => "9",
+    "name" => "string id",
+    "state" => "active",
+    "schedule" => %{"kind" => "every_ms", "every_ms" => 300_000},
+    "next_run_at" => base_now + 300_000,
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "created_at" => base_now,
+    "updated_at" => base_now
+  }
+}
+
+FakeStore.start([string_id_row])
+
+{state12, _clock12, _sink12} = init_state.(base_now, [], %{store_mod: FakeStore})
+job12_loaded = Map.get(state12.jobs, 9)
+
+{:reply, pause12_reply, state12} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "pause", job_id: "9"}), state12)
+
+{:reply, invalid12_reply, _state12} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: "9x"}), state12)
+
+check.(
+  "string ids from store rows and protocol messages are coerced strictly without ArithmeticError",
+  job12_loaded != nil and
+    state12.next_id == 10 and
+    Jason.decode!(pause12_reply)["ok"] == true and
+    Jason.decode!(pause12_reply)["job_id"] == 9 and
+    Jason.decode!(invalid12_reply)["ok"] == false and
+    Jason.decode!(invalid12_reply)["error"] == "invalid job_id"
 )
 
 failures = Agent.get(fails, &Enum.reverse/1)
