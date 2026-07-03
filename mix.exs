@@ -11,7 +11,7 @@ defmodule GenswarmsObjects.MixProject do
       source_url: "https://github.com/genlayerlabs/genswarms-objects",
       description:
         "Utility object handlers for genswarms swarms: cron (deterministic scheduler), " <>
-          "browse (allowlist-capped web browser for agents), metrics (durable daily counters), " <>
+          "browser (allowlist- or denylist-gated web browser for agents), metrics (durable daily counters), " <>
           "tips (rotating-content dispenser)",
       deps: deps()
     ]

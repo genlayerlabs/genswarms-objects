@@ -13,13 +13,13 @@
       "module": "Genswarms.Cron"
     },
     {
-      "name": "browse",
-      "dir": "packages/browse",
+      "name": "browser",
+      "dir": "packages/browser",
       "kind": "handler",
-      "description": "Allowlist-capped web browser object for agents: render/click/type/back with compact replies (context-bloat safe), off-cage redirect containment",
+      "description": "Web browser object for agents: render/click/type/back with compact replies. Two modes — allowlist (fail-closed) or denylist (allow any public host except a blocklist); denylist requires a deployment-provided IP-filtering egress proxy for sub-resource SSRF containment.",
       "docs": "README.md",
-      "skill": ".claude/skills/genswarms-browse-use/SKILL.md",
-      "module": "Genswarms.Browse"
+      "skill": ".claude/skills/genswarms-browser-use/SKILL.md",
+      "module": "Genswarms.Browser"
     },
     {
       "name": "metrics",
