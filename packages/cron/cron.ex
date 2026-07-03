@@ -776,6 +776,21 @@ defmodule Genswarms.Cron do
           )
         end
 
+        # Display story event (host events canvas) — one per completed run,
+        # status carried so the host reducer can render failures as issue rows
+        # and drop/dim ok-runs (they fire every few minutes). The breaker pause
+        # is its own story beat: a job silently stopping IS the incident.
+        emit_display(%{
+          kind: :job_run,
+          name: job.name,
+          status: result.status,
+          target: job.payload["target"]
+        })
+
+        if result.status != "ok" and job.state == "paused" and job.paused_by == "breaker" do
+          emit_display(%{kind: :job_run, name: job.name, status: "breaker_paused"})
+        end
+
         arm_timer(state, now)
     end
   end
@@ -1086,6 +1101,115 @@ defmodule Genswarms.Cron do
 
   # emit_event/4: optional events_mod (exports object/4 — e.g. a LogStore
   # wrapper); absent -> Logger metadata line.
+  # Display telemetry rides the shared genswarms-objects wire (same convention
+  # as the browser and metrics packages): configurable app env, host overrides
+  # it to its canvas wire. Never raises into the scheduler.
+  defp emit_display(meta) do
+    :telemetry.execute(
+      Application.get_env(:genswarms_objects, :display_wire, [:genswarms, :display]),
+      %{},
+      meta
+    )
+  rescue
+    _ -> :ok
+  end
+
+  @doc """
+  Dashboard extension (probed data contract — the host's dashboard source calls
+  this via `function_exported?`, never a compile dep). Reads the DURABLE job
+  rows from the injected store, so the page renders even when the scheduler
+  object is mid-restart: `dashboard_extension(store_mod: MyStore)`.
+
+  Returns `%{"dashboard_pages" => [page]}` in the generic page schema
+  (sections of `"metrics"` items + a `"table"`), or `%{}` without a store.
+  """
+  def dashboard_extension(opts \\ []) do
+    store_mod = Keyword.get(opts, :store_mod)
+
+    if is_nil(store_mod) do
+      %{}
+    else
+      jobs = safe_load_jobs(store_mod)
+      failing = Enum.count(jobs, &((&1[:last_status] || "ok") != "ok"))
+      paused = Enum.count(jobs, &(&1[:state] == "paused"))
+
+      %{
+        "dashboard_pages" => [
+          %{
+            "id" => "cron-jobs",
+            "label" => "Cron",
+            "icon" => "hero-clock",
+            "meta" => "#{length(jobs)} scheduled job(s)",
+            "sections" => [
+              %{
+                "type" => "metrics",
+                "title" => "Scheduler",
+                "items" => [
+                  %{"label" => "Jobs", "value" => length(jobs)},
+                  %{"label" => "Paused", "value" => paused},
+                  %{"label" => "Failing", "value" => failing}
+                ]
+              },
+              %{
+                "type" => "table",
+                "title" => "Jobs",
+                "meta" => "durable rows — survives a scheduler restart",
+                "columns" => [
+                  %{"key" => "name", "label" => "job"},
+                  %{"key" => "schedule", "label" => "schedule", "mono" => true},
+                  %{"key" => "target", "label" => "target", "mono" => true},
+                  %{"key" => "state", "label" => "state"},
+                  %{"key" => "next_run", "label" => "next run", "mono" => true},
+                  %{"key" => "last_status", "label" => "last", "align" => "right"},
+                  %{"key" => "failures", "label" => "consec fails", "align" => "right"}
+                ],
+                "rows" => Enum.map(jobs, &job_row/1)
+              }
+            ]
+          }
+        ]
+      }
+    end
+  end
+
+  defp safe_load_jobs(store_mod) do
+    if Code.ensure_loaded?(store_mod) and function_exported?(store_mod, :load_cron_jobs, 1) do
+      store_mod.load_cron_jobs(@load_states) || []
+    else
+      []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp job_row(job) do
+    %{
+      "name" => to_string(job[:name] || "?"),
+      "schedule" => describe_schedule(job[:schedule]),
+      "target" => to_string(get_in(job, [:payload, "target"]) || "?"),
+      "state" => to_string(job[:state] || "?"),
+      "next_run" => format_run_at(job[:next_run_at]),
+      "last_status" => to_string(job[:last_status] || "—"),
+      "failures" => job[:consecutive_failures] || 0
+    }
+  end
+
+  defp describe_schedule(%{"cron" => expr}), do: "cron " <> to_string(expr)
+  defp describe_schedule(%{"every_ms" => ms}) when is_integer(ms), do: "every #{div(ms, 1000)}s"
+  defp describe_schedule(%{"run_at" => at}), do: "once @ " <> format_run_at(at)
+  defp describe_schedule(%{cron: expr}), do: "cron " <> to_string(expr)
+  defp describe_schedule(%{every_ms: ms}) when is_integer(ms), do: "every #{div(ms, 1000)}s"
+  defp describe_schedule(%{run_at: at}), do: "once @ " <> format_run_at(at)
+  defp describe_schedule(_), do: "?"
+
+  defp format_run_at(ms) when is_integer(ms) do
+    ms |> DateTime.from_unix!(:millisecond) |> Calendar.strftime("%m-%d %H:%MZ")
+  rescue
+    _ -> "?"
+  end
+
+  defp format_run_at(_), do: "—"
+
   defp emit_event(state, event_type, message, opts) do
     ev = Map.get(state, :events_mod)
 

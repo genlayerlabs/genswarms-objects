@@ -198,6 +198,58 @@ defmodule Genswarms.Tips do
   defp normalize_guard(g) when is_integer(g) and g >= 0, do: g
   defp normalize_guard(_), do: @default_guard
 
+  @doc """
+  Dashboard extension (probed data contract — the host's dashboard source calls
+  this via `function_exported?`, never a compile dep). Reads the durable
+  fragment/seen tables from the injected store:
+  `dashboard_extension(store: MyStore)`. Returns `%{"dashboard_pages" => [page]}`
+  in the generic page schema, or `%{}` without a store.
+  """
+  def dashboard_extension(opts \\ []) do
+    store = Keyword.get(opts, :store)
+
+    if is_nil(store) do
+      %{}
+    else
+      fragments = safe(fn -> load_fragments(store) end, [])
+      seen = safe(fn -> load_seen(store) end, %{})
+      by_kind = Enum.frequencies_by(fragments, &(&1[:kind] || &1["kind"] || "?"))
+      seen_marks = seen |> Map.values() |> Enum.map(&length(List.wrap(&1))) |> Enum.sum()
+
+      %{
+        "dashboard_pages" => [
+          %{
+            "id" => "tips-pool",
+            "label" => "Tips",
+            "icon" => "hero-light-bulb",
+            "meta" => "#{length(fragments)} fragment(s)",
+            "sections" => [
+              %{
+                "type" => "metrics",
+                "title" => "Pool",
+                "items" =>
+                  [
+                    %{"label" => "Fragments", "value" => length(fragments)},
+                    %{"label" => "Recipients", "value" => map_size(seen)},
+                    %{"label" => "Seen marks", "value" => seen_marks}
+                  ] ++
+                    Enum.map(Enum.sort(by_kind), fn {kind, n} ->
+                      %{"label" => to_string(kind), "value" => n}
+                    end)
+              }
+            ]
+          }
+        ]
+      }
+    end
+  end
+
+  defp safe(fun, fallback) do
+    fun.() || fallback
+  rescue
+    _ -> fallback
+  end
+
   defp load_fragments(store) do
     if store?(store, :load_fragments, 0), do: store.load_fragments(), else: []
   end
