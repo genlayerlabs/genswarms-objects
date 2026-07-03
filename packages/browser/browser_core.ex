@@ -194,20 +194,62 @@ defmodule Genswarms.Browser.Core do
   # connecting to it, so `follow/5` gates every hop itself before any connection. TLS is
   # verified (no -k). A server that rejects HEAD (e.g. 405) aborts the browse fail-closed
   # rather than falling back to GET. The tests inject a fetcher instead of hitting the net.
+  #
+  # `gate/3` already resolved+vetted this host via `resolve_host` — but curl, given the
+  # raw URL, would re-resolve the host ITSELF, independently of that vetting. That's a
+  # TOCTOU: a host that flips public→private between the gate's resolution and curl's own
+  # resolution gets curl (i.e. the engine) to connect to an internal service. So we
+  # resolve+vet ONCE here too (`resolve_and_pin/1`) and pin curl to that vetted IP via
+  # `--resolve`, which makes curl skip its own DNS for this host:port entirely.
   defp http_head(url) do
-    args = [
+    host = URI.parse(url).host
+
+    case resolve_and_pin(host) do
+      {:ok, ip} ->
+        try do
+          case System.cmd(curl_bin(), head_args(url, ip), stderr_to_stdout: true) do
+            {out, 0} -> parse_curl_head(out)
+            {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
+          end
+        rescue
+          e -> {:error, {:curl_unavailable, Exception.message(e)}}
+        end
+
+      {:error, r} ->
+        {:error, r}
+    end
+  end
+
+  @doc false
+  # Build the curl HEAD argv, pinning `host:port` to the already-vetted `ip_string`
+  # so curl performs NO DNS of its own (closes the pre-flight rebinding TOCTOU).
+  @spec head_args(String.t(), String.t()) :: [String.t()]
+  def head_args(url, ip_string) do
+    uri = URI.parse(url)
+    port = uri.port || 443
+    [
       "-sS", "-o", "/dev/null", "-I", "--max-redirs", "0",
       "--max-time", "10", "--connect-timeout", "5",
+      "--resolve", "#{uri.host}:#{port}:#{ip_string}",
       "-w", "%{http_code} %{redirect_url}", "--", url
     ]
+  end
 
-    try do
-      case System.cmd(curl_bin(), args, stderr_to_stdout: true) do
-        {out, 0} -> parse_curl_head(out)
-        {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
-      end
-    rescue
-      e -> {:error, {:curl_unavailable, Exception.message(e)}}
+  @doc false
+  # Resolve `host`, reject the WHOLE host if empty or ANY address fails global_ip?/1
+  # (mixed public/private = rebinding-adjacent trick), else return the first vetted IP
+  # as a string (IPv6 uses the bare :inet.ntoa form; curl --resolve accepts it).
+  @spec resolve_and_pin(String.t(), resolver()) ::
+          {:ok, String.t()} | {:error, :internal_ip | {:dns, term()}}
+  def resolve_and_pin(host, resolver \\ &resolve_host/1) do
+    case resolver.(host) do
+      {:ok, []} -> {:error, {:dns, :empty}}
+      {:ok, ips} ->
+        if Enum.all?(ips, &global_ip?/1),
+          do: {:ok, ips |> hd() |> :inet.ntoa() |> to_string()},
+          else: {:error, :internal_ip}
+
+      {:error, r} -> {:error, {:dns, r}}
     end
   end
 
