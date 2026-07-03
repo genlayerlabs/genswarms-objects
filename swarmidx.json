@@ -29,6 +29,15 @@
       "docs": "README.md",
       "skill": ".claude/skills/genswarms-metrics-use/SKILL.md",
       "module": "Genswarms.Metrics"
+    },
+    {
+      "name": "tips",
+      "dir": "packages/tips",
+      "kind": "handler",
+      "description": "Rotating-content dispenser: fragment pools assembled per recipient by a configurable slot template — seen-tracked no-repeat rotation for content slots, weighted random dressing slots, seeded deterministic draw/commit (crash-safe retries), pending→live→retired lifecycle, persistence via injectable store",
+      "docs": "README.md",
+      "skill": ".claude/skills/genswarms-tips-use/SKILL.md",
+      "module": "Genswarms.Tips"
     }
   ]
 }

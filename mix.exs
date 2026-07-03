@@ -4,14 +4,15 @@ defmodule GenswarmsObjects.MixProject do
   def project do
     [
       app: :genswarms_objects,
-      version: "0.1.2",
+      version: "0.1.3",
       elixir: "~> 1.14",
       elixirc_paths: ["packages"],
       start_permanent: Mix.env() == :prod,
       source_url: "https://github.com/genlayerlabs/genswarms-objects",
       description:
         "Utility object handlers for genswarms swarms: cron (deterministic scheduler), " <>
-          "browse (allowlist-capped web browser for agents), metrics (durable daily counters)",
+          "browse (allowlist-capped web browser for agents), metrics (durable daily counters), " <>
+          "tips (rotating-content dispenser)",
       deps: deps()
     ]
   end

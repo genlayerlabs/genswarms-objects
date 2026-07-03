@@ -8,6 +8,7 @@ swarms — one lockstep monorepo, three swarmidx packages (`kind: handler`):
 | `cron` (`packages/cron`) | `Genswarms.Cron` | Deterministic global scheduler: a job = one due datetime + one stamped message to one **allowlisted** target. One-shot, fixed-rate, and cron-expression schedules; declarative seed_jobs; consecutive-failure breaker. Trust-gated sources, retry/backoff, bounded concurrency, persistence via injectable store. |
 | `browse` (`packages/browse`) | `Genswarms.Browse` | Allowlist-capped web browser for agents (render/click/type/back). Compact replies by default (head + nav-link index — the full page never re-enters agent context unless asked); off-cage redirect containment (re-gate on settle, session destroyed on escape). |
 | `metrics` (`packages/metrics`) | `Genswarms.Metrics` | Fire-and-forget counters: closed key allowlist (a prompt-injected agent can't mint unbounded keys), in-memory totals, periodic flush to an injectable durable store. |
+| `tips` (`packages/tips`) | `Genswarms.Tips` | Rotating-content dispenser: per-recipient no-repeat rotation over fragment pools (configurable rotating + weighted-dressing slots), seeded deterministic `draw`/`commit` (a retried send reproduces the same message), pending→live→retired content lifecycle, injectable store. Makes no trust decisions — recipient selection and consent belong to the caller. |
 
 Extracted from wingston-rally-bot (browse, metrics) and micro-markets (cron) —
 the duplication these repos carried before the registry existed.
