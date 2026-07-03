@@ -210,10 +210,23 @@ defmodule Genswarms.Cron do
     # both to_string message-derived fields, and a crafted map/list value
     # would raise Protocol.UndefinedError on the engine's rescue-less cast
     # path (ObjectServer crash). Reject, never coerce.
-    with :ok <- validate_create_fields(msg) do
+    #
+    # F3: schedule normalization/floor and target/payload validation must
+    # also run BEFORE the once-terminal-dedupe lookup — otherwise a garbage
+    # schedule or a disallowed target on a once:true re-create with a
+    # terminal dedupe_key would short-circuit straight to {ok:true,
+    # deduped:true} instead of being rejected. Only the past-guard
+    # (check_not_past, in create_live_job) stays AFTER the dedupe lookup —
+    # skipped entirely on a dedupe hit, because a once:true re-create with a
+    # now-past run_at must still no-op with deduped:true (load-bearing; see
+    # checks/cron_kinds_test.exs).
+    with :ok <- validate_create_fields(msg),
+         {:ok, norm} <- Schedule.normalize(due_value(msg), now),
+         :ok <- check_floor(norm, state),
+         {:ok, _payload} <- normalize_payload(msg, state) do
       case once_terminal_dedupe_row(state, msg) do
         nil ->
-          create_live_job(from, msg, state, now)
+          create_live_job(from, msg, norm, state, now)
 
         row ->
           {:reply, Jason.encode!(terminal_dedupe_reply(row)), arm_timer(state, now)}
@@ -224,10 +237,8 @@ defmodule Genswarms.Cron do
     end
   end
 
-  defp create_live_job(from, msg, state, now) do
-    with {:ok, norm} <- Schedule.normalize(due_value(msg), now),
-         :ok <- check_floor(norm, state),
-         :ok <- check_not_past(norm, now, state) do
+  defp create_live_job(from, msg, norm, state, now) do
+    with :ok <- check_not_past(norm, now, state) do
       case existing_dedupe_job(state, msg["dedupe_key"]) do
         nil ->
           insert_created_job(from, msg, norm, state, now)
@@ -295,6 +306,9 @@ defmodule Genswarms.Cron do
 
       not string_or_nil?(msg["misfire"]) ->
         {:error, "misfire must be a string"}
+
+      not (is_nil(msg["once"]) or is_boolean(msg["once"])) ->
+        {:error, "once must be a boolean"}
 
       true ->
         :ok
