@@ -32,7 +32,9 @@ authority (they validate the message they receive).
   tick_ms: 60_000, max_concurrency: 16, max_attempts: 3,
   breaker_threshold: 5,         # optional; consecutive failures before pause
   seed_jobs: [                  # optional; upsert-by-dedupe_key at init
-    {%{"run_at" => "2026-07-15T10:00:00Z"}, :daily_report, %{"user_id" => 42}}
+    %{name: "daily-report", dedupe_key: "loop:daily-report",
+      schedule: %{"cron" => "0 8 * * *"},
+      target: "reporter", message: %{"action" => "run", "loop" => "daily"}}
   ]
 }}
 ```
@@ -63,8 +65,10 @@ recurring jobs never reach a terminal-failed state.
 
 ## Minimum period floor
 
-One-shot and cron jobs are not subject to a `min_period_ms` floor. Fixed-rate jobs
-(every_ms) enforce it: the engine will never attempt a retry or re-arm sooner.
+`min_period_ms` (default 60_000) is enforced at CREATION for `every_ms` jobs
+only. One-shot and cron-expression jobs are exempt (cron is inherently
+minute-resolution). It is NEVER applied to retry attempts — those are governed
+solely by `retry_backoff_ms`, which may legitimately be shorter than the floor.
 
 ## Grid rule
 
@@ -74,9 +78,9 @@ guarantees exactly one catch-up after downtime and no duplicate runs.
 
 ## List rows
 
-The `list` response rows now include `kind` (one of `"one_shot"`, `"fixed_rate"`,
-`"cron_expr"`) and `paused_by` (absent if running, or `"breaker"` if paused by
-the consecutive-failure breaker).
+The `list` response rows include `kind` — the schedule kind string, one of
+`"run_at"`, `"every_ms"`, `"cron"` — and `paused_by` (`nil` normally, or
+`"breaker"` when the consecutive-failure breaker parked the job).
 
 ## Store seam (optional)
 

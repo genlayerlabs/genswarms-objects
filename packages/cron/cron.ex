@@ -2,8 +2,9 @@ defmodule Genswarms.Cron do
   @moduledoc """
   Global deterministic scheduler object.
 
-  This object is deliberately not market-scoped. A job is one due datetime plus
-  one stamped message to one allowlisted target. It owns timing, concurrency,
+  This object is deliberately not market-scoped. A job is one schedule — a
+  one-shot datetime, a fixed-rate `every_ms` interval, or a 5-field UTC cron
+  expression — plus one stamped message to one allowlisted target. It owns timing, concurrency,
   persistence, and audit; target objects still own domain authority.
   """
 
