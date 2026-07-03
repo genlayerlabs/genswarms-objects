@@ -500,6 +500,52 @@ check.(
     map_size(state9c_default.jobs) == 1
 )
 
+# ── Vector 9c (F3): a once-dedupe hit no longer skips create validation ──
+# Schedule normalization/floor and target/payload validation run BEFORE the
+# terminal-dedupe lookup — a garbage schedule with a terminal dedupe_key must
+# reject ok:false, never short-circuit to {ok:true, deduped:true}. Only the
+# past-guard stays skipped on a dedupe hit: a once:true re-create with a
+# now-past run_at still no-ops deduped (load-bearing for callers that re-arm
+# the same one-shot on every poll).
+
+FakeStore.start([])
+
+{state9d, _clock9d, _sink9d} = init_state.(base_now, [], %{store_mod: FakeStore})
+
+{:reply, reply9d_create, state9d} =
+  create.(state9d, :ops, %{run_at: base_now, dedupe_key: "runtime:once-f3", once: true})
+
+job9d_id = Jason.decode!(reply9d_create)["job_id"]
+{:reply, _tick9d, state9d} = tick.(state9d, :ops)
+
+{:reply, reply9d_bad, state9d} =
+  create.(state9d, :ops, %{
+    schedule: %{cron: "garbage"},
+    dedupe_key: "runtime:once-f3",
+    once: true
+  })
+
+decoded9d_bad = Jason.decode!(reply9d_bad)
+
+{:reply, reply9d_past, state9d} =
+  create.(state9d, :ops, %{
+    run_at: base_now - 10 * 60_000,
+    dedupe_key: "runtime:once-f3",
+    once: true
+  })
+
+decoded9d_past = Jason.decode!(reply9d_past)
+
+check.(
+  "once:true + terminal dedupe_key: an INVALID schedule is rejected ok:false (not deduped); a valid-but-past run_at still no-ops {ok:true, deduped:true}",
+  decoded9d_bad["ok"] == false and
+    decoded9d_bad["deduped"] != true and
+    decoded9d_past["ok"] == true and
+    decoded9d_past["deduped"] == true and
+    decoded9d_past["job_id"] == job9d_id and
+    map_size(state9d.jobs) == 0
+)
+
 # ── Vector 10 (I5): misfire "skip" honored on ORDINARY downtime (active row loaded overdue) ──
 # Two identical active every_ms jobs missed 5 occurrences while the box was down
 # (not crashed mid-run): the skip one must advance to the next FUTURE grid point

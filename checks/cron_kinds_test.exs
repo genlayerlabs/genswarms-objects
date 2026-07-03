@@ -811,6 +811,60 @@ check.(
     String.contains?(job16d.last_error || "", "task down")
 )
 
+# ── Vector 16e (F2): run_now at max_concurrency saturation is rejected, not launched ──
+# run_now is an immediate-fire request with no due-queue to defer onto, so at
+# saturation it must reject ({ok:false, "at max concurrency"}) with the task
+# count unchanged — it may never push concurrency past the configured cap the
+# way the pre-fix unconditional launch did.
+
+{:ok, clock16e} = Agent.start_link(fn -> base_now end)
+{:ok, sink16e} = Agent.start_link(fn -> [] end)
+
+{:ok, state16e} =
+  Cron.init(%{
+    swarm_name: "kinds-test",
+    name: :cron,
+    auto_tick: false,
+    async?: true,
+    max_concurrency: 1,
+    now_fn: fn -> Agent.get(clock16e, & &1) end,
+    deliver_fn: fn target, from, json ->
+      Process.sleep(100)
+      Agent.update(sink16e, &[{target, from, json} | &1])
+      :ok
+    end,
+    trusted_sources: [:ops],
+    allowed_targets: %{proactive: ["run"]},
+    min_period_ms: 60_000
+  })
+
+{:reply, reply16e_a, state16e} = create.(state16e, :ops, %{run_at: base_now + 60_000})
+{:reply, reply16e_b, state16e} = create.(state16e, :ops, %{run_at: base_now + 60_000})
+job16e_a = Jason.decode!(reply16e_a)["job_id"]
+job16e_b = Jason.decode!(reply16e_b)["job_id"]
+
+{:reply, run16e_a, state16e} = run_now.(state16e, :ops, job16e_a)
+tasks16e_saturated = map_size(state16e.tasks)
+
+{:reply, run16e_b, state16e} = run_now.(state16e, :ops, job16e_b)
+decoded_run16e_b = Jason.decode!(run16e_b)
+tasks16e_after = map_size(state16e.tasks)
+job16e_b_after = Map.fetch!(state16e.jobs, job16e_b)
+
+state16e = drain_task.(state16e)
+
+check.(
+  "run_now at max_concurrency saturation: rejected ok:false \"at max concurrency\", task count unchanged, the second job untouched",
+  Jason.decode!(run16e_a)["ok"] == true and
+    tasks16e_saturated == 1 and
+    decoded_run16e_b["ok"] == false and
+    decoded_run16e_b["error"] == "at max concurrency" and
+    tasks16e_after == 1 and
+    job16e_b_after.state == "active" and
+    job16e_b_after.next_run_at == base_now + 60_000 and
+    map_size(state16e.tasks) == 0
+)
+
 # ── Vector 17 (I3): poisoned stored cron expr must not crash completion — terminal, reason kept ──
 # A corrupt persisted row is the real ingress (create validates exprs); poisoning
 # the in-memory schedule after create reproduces it without a store harness.
@@ -893,6 +947,26 @@ check.(
 check.(
   "valid scalar fields still accepted after input validation",
   Jason.decode!(reply18ok)["ok"] == true
+)
+
+# ── Vector 18b (F1a): non-boolean once is rejected, never coerced ──
+# "once": "true" (string) used to slip past validation and silently degrade
+# to the weaker live-only dedupe; once must be nil or a boolean —
+# once: false is accepted (treated as absent).
+
+{:reply, reply18b_bad, _state18b} =
+  create.(state18a, :ops, %{schedule: %{every_ms: 300_000}, once: "true", dedupe_key: "dk18b"})
+
+decoded18b_bad = Jason.decode!(reply18b_bad)
+
+{:reply, reply18b_false, _state18b} =
+  create.(state18a, :ops, %{schedule: %{every_ms: 300_000}, once: false, dedupe_key: "dk18c"})
+
+check.(
+  "\"once\": \"true\" (string) rejects ok:false \"once must be a boolean\"; once: false is accepted (treated as absent)",
+  decoded18b_bad["ok"] == false and
+    decoded18b_bad["error"] == "once must be a boolean" and
+    Jason.decode!(reply18b_false)["ok"] == true
 )
 
 # ── Vector 19 (W2 M2): origin is free-form scalar provenance and context_from is gone ──
