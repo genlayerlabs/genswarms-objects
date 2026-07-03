@@ -8,7 +8,7 @@
 # redirect pre-flight never sees JS/meta redirects, so this re-gate is the only backstop
 # and it must see the post-settle ground truth.
 #
-# These tests exercise the REAL Genswarms.Browse.AgentBrowser adapter against a FAKE
+# These tests exercise the REAL Genswarms.Browser.AgentBrowser adapter against a FAKE
 # `agent-browser` CLI (a bash shim prepended to PATH — no network, no Chromium). The
 # shim models the redirect race deterministically: `get url` answers the allowed URL
 # BEFORE the first snapshot and the off-cage URL AFTER it, so a pre-settle capture (the
@@ -69,10 +69,10 @@ defmodule FakeAgentBrowser do
   end
 end
 
-defmodule GenswarmsBrowseRegateSettleTest do
+defmodule GenswarmsBrowserRegateSettleTest do
   use ExUnit.Case, async: false
-  alias Genswarms.Browse.AgentBrowser
-  alias Genswarms.Browse
+  alias Genswarms.Browser.AgentBrowser
+  alias Genswarms.Browser
 
   setup_all do
     FakeAgentBrowser.install!()
@@ -109,7 +109,7 @@ defmodule GenswarmsBrowseRegateSettleTest do
     st = object_state()
 
     {:reply, json, st2} =
-      Browse.handle_message(:agentE, ~s({"action":"render","url":"#{FakeAgentBrowser.allowed_url()}"}), st)
+      Browser.handle_message(:agentE, ~s({"action":"render","url":"#{FakeAgentBrowser.allowed_url()}"}), st)
 
     assert %{"error" => "blocked"} = Jason.decode!(json)
     refute Map.has_key?(st2.sessions, :agentE),
@@ -121,7 +121,7 @@ defmodule GenswarmsBrowseRegateSettleTest do
     st = object_state()
 
     {:reply, json, st2} =
-      Browse.handle_message(:agentS, ~s({"action":"render","url":"#{FakeAgentBrowser.allowed_url()}"}), st)
+      Browser.handle_message(:agentS, ~s({"action":"render","url":"#{FakeAgentBrowser.allowed_url()}"}), st)
 
     m = Jason.decode!(json)
     refute Map.has_key?(m, "error"), "stable page wrongly refused: #{inspect(m)}"
@@ -137,7 +137,7 @@ defmodule GenswarmsBrowseRegateSettleTest do
     on_exit(fn -> File.rm(allow) end)
 
     {:ok, st} =
-      Browse.init(%{
+      Browser.init(%{
         allowlist_path: allow,
         renderer: AgentBrowser,
         resolver: fn _host -> {:ok, [{93, 184, 216, 34}]} end,

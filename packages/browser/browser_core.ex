@@ -1,7 +1,7 @@
-defmodule Genswarms.Browse.Core do
+defmodule Genswarms.Browser.Core do
   @moduledoc """
   Promotable core for the allowlist-capped web browser. No wingston/campaign
-  concept — could move to `Genswarms.Browse` unchanged.
+  concept — could move to `Genswarms.Browser` unchanged.
 
   Security model (measured against agent-browser 0.27.1 — see the spec): this module
   is the SOLE gate on which URL the browser may sit on. `global_ip?/1` is the SSRF
@@ -18,18 +18,19 @@ defmodule Genswarms.Browse.Core do
   @max_redirects 3
 
   @type resolver :: (String.t() -> {:ok, [:inet.ip_address()]} | {:error, term()})
+  @type policy :: {:allow, MapSet.t(String.t())} | {:deny, MapSet.t(String.t())}
 
   @doc """
   Gate a URL the agent wants opened. THE sole gate (agent-browser does not gate the
   open target). `resolver` is injected for testability; defaults to real DNS.
   """
-  @spec gate(String.t(), MapSet.t(String.t()), resolver()) :: :ok | {:error, term()}
-  def gate(url, allowset, resolver \\ &resolve_host/1) do
+  @spec gate(String.t(), policy(), resolver()) :: :ok | {:error, term()}
+  def gate(url, policy, resolver \\ &resolve_host/1) do
     with {:ok, uri} <- parse(url),
          :ok <- https_only(uri),
          :ok <- no_userinfo(uri),
          :ok <- ok_port(uri),
-         :ok <- allowed?(uri.host, allowset),
+         :ok <- membership(uri.host, policy),
          :ok <- ssrf_safe?(uri.host, resolver) do
       :ok
     end
@@ -52,8 +53,38 @@ defmodule Genswarms.Browse.Core do
   defp ok_port(%URI{port: p}) when p in [nil, 443], do: :ok
   defp ok_port(%URI{port: p}), do: {:error, {:bad_port, p}}
 
-  defp allowed?(host, allowset) do
-    if MapSet.member?(allowset, String.downcase(host)), do: :ok, else: {:error, {:not_allowed, host}}
+  # Allowlist: exact-host membership (unchanged semantics). Denylist: pass unless blocked.
+  defp membership(host, {:allow, set}) do
+    if MapSet.member?(set, String.downcase(host)), do: :ok, else: {:error, {:not_allowed, host}}
+  end
+
+  defp membership(host, {:deny, set}) do
+    if blocked?(host, set), do: {:error, {:not_allowed, host}}, else: :ok
+  end
+
+  @doc "Normalize a host for matching: lowercase, strip one trailing dot, punycode→ascii."
+  @spec normalize_host(String.t()) :: String.t()
+  def normalize_host(host) when is_binary(host) do
+    host
+    |> String.downcase()
+    |> String.trim_trailing(".")
+    |> to_ascii()
+  end
+
+  # Seed blocklist is all-ASCII; keep this a straight passthrough (no IDNA dependency).
+  defp to_ascii(host), do: host
+
+  @doc "True iff `host` is blocked by `blockset` on a LABEL boundary (apex or subdomain)."
+  @spec blocked?(String.t(), MapSet.t(String.t())) :: boolean()
+  def blocked?(host, blockset) do
+    h = normalize_host(host)
+    labels = String.split(h, ".")
+
+    0..(length(labels) - 1)
+    |> Enum.any?(fn i ->
+      suffix = labels |> Enum.drop(i) |> Enum.join(".")
+      MapSet.member?(blockset, suffix)
+    end)
   end
 
   defp ssrf_safe?(host, resolver) do
@@ -129,19 +160,19 @@ defmodule Genswarms.Browse.Core do
   is only ever pointed at a fully-validated terminal URL. `opts[:fetcher]` and
   `opts[:resolver]` are injected for tests; defaults hit the network via `curl`.
   """
-  @spec resolve_redirects(String.t(), MapSet.t(String.t()), keyword()) :: {:ok, String.t()} | {:error, term()}
-  def resolve_redirects(url, allowset, opts \\ []) do
+  @spec resolve_redirects(String.t(), policy(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_redirects(url, policy, opts \\ []) do
     fetcher = Keyword.get(opts, :fetcher, &http_head/1)
     resolver = Keyword.get(opts, :resolver, &resolve_host/1)
-    follow(url, allowset, fetcher, resolver, @max_redirects)
+    follow(url, policy, fetcher, resolver, @max_redirects)
   end
 
-  defp follow(_url, _allow, _fetcher, _resolver, 0), do: {:error, :too_many_redirects}
-  defp follow(url, allowset, fetcher, resolver, n) do
-    with :ok <- gate(url, allowset, resolver) do
+  defp follow(_url, _policy, _fetcher, _resolver, 0), do: {:error, :too_many_redirects}
+  defp follow(url, policy, fetcher, resolver, n) do
+    with :ok <- gate(url, policy, resolver) do
       case fetcher.(url) do
         {status, loc} when status in 300..399 and is_binary(loc) ->
-          follow(URI.merge(URI.parse(url), loc) |> URI.to_string(), allowset, fetcher, resolver, n - 1)
+          follow(URI.merge(URI.parse(url), loc) |> URI.to_string(), policy, fetcher, resolver, n - 1)
         {status, nil} when status in 300..399 ->
           {:error, {:missing_location, status}}
         {status, _} when status in 200..299 ->
@@ -163,20 +194,62 @@ defmodule Genswarms.Browse.Core do
   # connecting to it, so `follow/5` gates every hop itself before any connection. TLS is
   # verified (no -k). A server that rejects HEAD (e.g. 405) aborts the browse fail-closed
   # rather than falling back to GET. The tests inject a fetcher instead of hitting the net.
+  #
+  # `gate/3` already resolved+vetted this host via `resolve_host` — but curl, given the
+  # raw URL, would re-resolve the host ITSELF, independently of that vetting. That's a
+  # TOCTOU: a host that flips public→private between the gate's resolution and curl's own
+  # resolution gets curl (i.e. the engine) to connect to an internal service. So we
+  # resolve+vet ONCE here too (`resolve_and_pin/1`) and pin curl to that vetted IP via
+  # `--resolve`, which makes curl skip its own DNS for this host:port entirely.
   defp http_head(url) do
-    args = [
+    host = URI.parse(url).host
+
+    case resolve_and_pin(host) do
+      {:ok, ip} ->
+        try do
+          case System.cmd(curl_bin(), head_args(url, ip), stderr_to_stdout: true) do
+            {out, 0} -> parse_curl_head(out)
+            {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
+          end
+        rescue
+          e -> {:error, {:curl_unavailable, Exception.message(e)}}
+        end
+
+      {:error, r} ->
+        {:error, r}
+    end
+  end
+
+  @doc false
+  # Build the curl HEAD argv, pinning `host:port` to the already-vetted `ip_string`
+  # so curl performs NO DNS of its own (closes the pre-flight rebinding TOCTOU).
+  @spec head_args(String.t(), String.t()) :: [String.t()]
+  def head_args(url, ip_string) do
+    uri = URI.parse(url)
+    port = uri.port || 443
+    [
       "-sS", "-o", "/dev/null", "-I", "--max-redirs", "0",
       "--max-time", "10", "--connect-timeout", "5",
+      "--resolve", "#{uri.host}:#{port}:#{ip_string}",
       "-w", "%{http_code} %{redirect_url}", "--", url
     ]
+  end
 
-    try do
-      case System.cmd(curl_bin(), args, stderr_to_stdout: true) do
-        {out, 0} -> parse_curl_head(out)
-        {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
-      end
-    rescue
-      e -> {:error, {:curl_unavailable, Exception.message(e)}}
+  @doc false
+  # Resolve `host`, reject the WHOLE host if empty or ANY address fails global_ip?/1
+  # (mixed public/private = rebinding-adjacent trick), else return the first vetted IP
+  # as a string (IPv6 uses the bare :inet.ntoa form; curl --resolve accepts it).
+  @spec resolve_and_pin(String.t(), resolver()) ::
+          {:ok, String.t()} | {:error, :internal_ip | {:dns, term()}}
+  def resolve_and_pin(host, resolver \\ &resolve_host/1) do
+    case resolver.(host) do
+      {:ok, []} -> {:error, {:dns, :empty}}
+      {:ok, ips} ->
+        if Enum.all?(ips, &global_ip?/1),
+          do: {:ok, ips |> hd() |> :inet.ntoa() |> to_string()},
+          else: {:error, :internal_ip}
+
+      {:error, r} -> {:error, {:dns, r}}
     end
   end
 
@@ -209,11 +282,11 @@ defmodule Genswarms.Browse.Core do
   end
 end
 
-defmodule Genswarms.Browse.Renderer do
+defmodule Genswarms.Browser.Renderer do
   @moduledoc """
   Swappable renderer with a PERSISTENT session: `navigate/3` opens a URL in the named
   session and leaves it open; `act/3` interacts with the live page (click/back/type/
-  press); `close/1` ends the session. Default impl: `Genswarms.Browse.AgentBrowser`.
+  press); `close/1` ends the session. Default impl: `Genswarms.Browser.AgentBrowser`.
 
   Every callback that touches the page returns the LANDED url so the object can re-gate
   it — measured against agent-browser 0.27.1: the `--allowed-domains` cage gates `open`
@@ -230,7 +303,7 @@ defmodule Genswarms.Browse.Renderer do
   @callback close(session :: String.t()) :: :ok
 end
 
-defmodule Genswarms.Browse.AgentBrowser do
+defmodule Genswarms.Browser.AgentBrowser do
   @moduledoc """
   agent-browser adapter over a persistent named session. Snapshots are taken with
   `--urls` (links carry their absolute hrefs — without this the agent cannot navigate
@@ -256,7 +329,7 @@ defmodule Genswarms.Browse.AgentBrowser do
   `cmd/1` uses System.cmd (argv, no shell), so there is no shell injection surface
   either way.
   """
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
 
   @bin "agent-browser"
   # Main content is far smaller than the old full-page snapshot (the intro article is
@@ -411,12 +484,25 @@ defmodule Genswarms.Browse.AgentBrowser do
       String.length(String.trim(out)) >= 200
   end
 
+  @doc false
+  # Build the `agent-browser open` argv. `allowed` is omitted (no `--allowed-domains`
+  # flag at all) when nil/blank — denylist mode has no allowlist string to pass, and
+  # agent-browser must not be handed an empty/garbage value for the flag.
+  @spec open_args(String.t(), String.t(), String.t() | nil) :: [String.t()]
+  def open_args(url, session, allowed) do
+    base = ["open", url]
+    domains = if is_binary(allowed) and allowed != "", do: ["--allowed-domains", allowed], else: []
+    base ++ domains ++ ["--session", session, "--json"]
+  end
+
   defp open_with_retry(url, allowed, session) do
-    case cmd(["open", url, "--allowed-domains", allowed, "--session", session, "--json"]) do
+    args = open_args(url, session, allowed)
+
+    case cmd(args) do
       {out, 0} -> {out, 0}
       {_, _} ->
         Process.sleep(600)
-        cmd(["open", url, "--allowed-domains", allowed, "--session", session, "--json"])
+        cmd(args)
     end
   end
 

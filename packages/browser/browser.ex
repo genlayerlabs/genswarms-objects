@@ -1,4 +1,4 @@
-defmodule Genswarms.Browse do
+defmodule Genswarms.Browser do
   @moduledoc """
   Allowlist-capped web browser for the isolated agent. The agent drives a real
   (persistent) browser session through five actions — `render` (navigate to a URL),
@@ -25,7 +25,7 @@ defmodule Genswarms.Browse do
   snapshot, so every action returns a fresh one.
   """
   require Logger
-  alias Genswarms.Browse.Core, as: Browse
+  alias Genswarms.Browser.Core, as: Browse
 
   # Agent-supplied strings that become CLI argv (System.cmd: no shell, but keep the
   # contract tight anyway): refs are snapshot handles, keys are key/chord names.
@@ -37,7 +37,7 @@ defmodule Genswarms.Browse do
   # into ITS OWN global CLI flag when the text is a single, whitespace-free token
   # starting with `-` — e.g. text "--json" flips agent-browser's own output to JSON. The
   # audit's originally-suggested `--` argv terminator does NOT stop this (agent-browser
-  # ignores it — verified). System.cmd never invokes a shell (Genswarms.Browse.AgentBrowser
+  # ignores it — verified). System.cmd never invokes a shell (Genswarms.Browser.AgentBrowser
   # .cmd/1), so every element of the args list is passed as one exact, unsplit OS argv
   # entry: verb_args(:type, …) (browse_core.ex) hands `text` through WHOLE as a single
   # element, so text WITH internal whitespace ("-- hello world") can never be re-split
@@ -51,7 +51,7 @@ defmodule Genswarms.Browse do
   @flag_shaped_type_re ~r/\A-\S*\z/
 
   # A compact reply truncates the page's main BODY to a head but KEEPS the nav-link index
-  # the renderer appends to the page text under this header (Genswarms.Browse.AgentBrowser.
+  # the renderer appends to the page text under this header (Genswarms.Browser.AgentBrowser.
   # nav_section/2). Splitting on it lets the agent still navigate (the "couldn't reach
   # GenVM" incident was exactly the nav index going missing) while the bulky body stays out
   # of context. Must match that header; the live test (tests/browse_live.exs §3c) pins the
@@ -60,20 +60,57 @@ defmodule Genswarms.Browse do
 
   def init(config) do
     # No :code.priv_dir (objects are Code.require_file'd, there is no :wingston OTP app);
-    # configs pass an explicit :allowlist_path (Task 6). Env override, then a cwd default.
-    path = Map.get(config, :allowlist_path) || System.get_env("WINGSTON_BROWSE_ALLOWLIST") ||
-             Path.join(File.cwd!(), "config/browse-allowlist.txt")
-    allowset = load_allowlist(path)
+    # configs pass an explicit :allowlist_path/:blocklist_path (Task 6). Env override, then
+    # a cwd default. `mode` selects allowlist (default, back-compat) or denylist: in denylist
+    # mode there is no global allowed_domains string (the renderer isn't handed a positive
+    # list), so allowed_domains is nil and the gate/redirect logic runs off `policy` alone.
+    mode = Map.get(config, :mode, :allowlist)
 
-    renderer = Map.get(config, :renderer, Genswarms.Browse.AgentBrowser)
-    if renderer == Genswarms.Browse.AgentBrowser and System.find_executable("agent-browser") == nil,
+    {policy, allowed_domains} =
+      case mode do
+        :denylist ->
+          path =
+            Map.get(config, :blocklist_path) || System.get_env("WINGSTON_BROWSER_BLOCKLIST") ||
+              Path.join(File.cwd!(), "config/browser-blocklist.txt")
+
+          case load_hostset(path) do
+            {:ok, set} ->
+              Logger.info("browser: denylist mode — #{MapSet.size(set)} blocked host(s) from #{path}")
+              {{:deny, set}, nil}
+
+            {:error, r} ->
+              Logger.error("browser: denylist #{path} unreadable (#{inspect(r)}) — FAIL-CLOSED, blocking everything")
+              {{:allow, MapSet.new()}, nil}
+          end
+
+        _ ->
+          path =
+            Map.get(config, :allowlist_path) || System.get_env("WINGSTON_BROWSE_ALLOWLIST") ||
+              Path.join(File.cwd!(), "config/browse-allowlist.txt")
+
+          set =
+            case load_hostset(path) do
+              {:ok, s} -> s
+              {:error, _} -> MapSet.new()
+            end
+
+          if MapSet.size(set) == 0,
+            do: Logger.error("browser: allowlist #{path} empty/unreadable — fail-closed"),
+            else: Logger.info("browser: allowlist mode — #{MapSet.size(set)} host(s) from #{path}")
+
+          {{:allow, set}, Browse.allowed_domains_arg(set)}
+      end
+
+    renderer = Map.get(config, :renderer, Genswarms.Browser.AgentBrowser)
+    if renderer == Genswarms.Browser.AgentBrowser and System.find_executable("agent-browser") == nil,
       do: Logger.error("browse: `agent-browser` not on PATH — render requests will fail with render_failed. Install: brew install agent-browser && agent-browser install")
 
     {:ok,
      %{
-       allowset: allowset,
-       # the --allowed-domains string is passed to the renderer per call (no global state)
-       allowed_domains: Browse.allowed_domains_arg(allowset),
+       policy: policy,
+       # the --allowed-domains string is passed to the renderer per call (no global state);
+       # nil in denylist mode (no positive allowlist to hand the renderer).
+       allowed_domains: allowed_domains,
        renderer: renderer,
        resolver: Map.get(config, :resolver, &Browse.resolve_host/1),
        redirect_fetcher: Map.get(config, :redirect_fetcher),
@@ -167,7 +204,7 @@ defmodule Genswarms.Browse do
   defp do_render(from, url, full?, state) do
     cond do
       over_rate?(from, state) ->
-        display(:browse_done, %{agent: from, verdict: "rate_limited"})
+        display(:browser_done, %{agent: from, verdict: "rate_limited"})
         Logger.info("browse: from=#{from} url=#{url} verdict=rate_limited")
         {:reply, err("rate_limited"), state}
 
@@ -183,17 +220,17 @@ defmodule Genswarms.Browse do
             do: [fetcher: state.redirect_fetcher, resolver: state.resolver],
             else: [resolver: state.resolver]
 
-        with :ok <- Browse.gate(url, state.allowset, state.resolver),
-             {:ok, final} <- Browse.resolve_redirects(url, state.allowset, ropts) do
+        with :ok <- Browse.gate(url, state.policy, state.resolver),
+             {:ok, final} <- Browse.resolve_redirects(url, state.policy, ropts) do
           {sess, state} = ensure_session(from, state)
           r = state.renderer
           ad = state.allowed_domains
-          display(:browse_dispatch, %{agent: from, url: url})
+          display(:browser_dispatch, %{agent: from, url: url})
           Logger.info("browse: from=#{from} url=#{url} resolved=#{final} verdict=dispatched session=#{sess}")
           deliver(from, "render #{url}", render_sync(fn -> r.navigate(final, sess, ad) end, state), full?, state)
         else
           {:error, {:not_allowed, _}} ->
-            display(:browse_done, %{agent: from, verdict: "not_allowed"})
+            display(:browser_done, %{agent: from, verdict: "not_allowed"})
             Logger.info("browse: from=#{from} url=#{url} verdict=not_allowed")
             {:reply, err("not_allowed"), state}
 
@@ -202,12 +239,12 @@ defmodule Genswarms.Browse do
           # 2026-06-10: a 404'd docs page reported as blocked → the agent fabricated
           # the page's content instead of saying it couldn't be loaded).
           {:error, {:http_status, s}} ->
-            display(:browse_done, %{agent: from, verdict: "render_failed"})
+            display(:browser_done, %{agent: from, verdict: "render_failed"})
             Logger.info("browse: from=#{from} url=#{url} verdict=render_failed reason=http_#{s}")
             {:reply, err("render_failed"), state}
 
           {:error, reason} ->
-            display(:browse_done, %{agent: from, verdict: "blocked"})
+            display(:browser_done, %{agent: from, verdict: "blocked"})
             Logger.info("browse: from=#{from} url=#{url} verdict=blocked reason=#{inspect(reason)}")
             {:reply, err("blocked"), state}
         end
@@ -217,22 +254,22 @@ defmodule Genswarms.Browse do
   defp do_act(from, verb, arg, desc, full?, state) do
     cond do
       not Map.has_key?(state.sessions, from) ->
-        display(:browse_done, %{agent: from, verdict: "no_session"})
+        display(:browser_done, %{agent: from, verdict: "no_session"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=no_session")
         {:reply, err("no_session — render a page first"), state}
 
       verb == :type and flag_shaped_type?(arg.text) ->
-        display(:browse_done, %{agent: from, verdict: "flag_shaped_text"})
+        display(:browser_done, %{agent: from, verdict: "flag_shaped_text"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=flag_shaped_text")
         {:reply, err("bad_arg — type text can't be a single '-'-leading word (it looks like a CLI flag); add a space or another word"), state}
 
       not valid_arg?(verb, arg) ->
-        display(:browse_done, %{agent: from, verdict: "bad_arg"})
+        display(:browser_done, %{agent: from, verdict: "bad_arg"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=bad_arg")
         {:reply, err("bad_arg"), state}
 
       over_rate?(from, state) ->
-        display(:browse_done, %{agent: from, verdict: "rate_limited"})
+        display(:browser_done, %{agent: from, verdict: "rate_limited"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=rate_limited")
         {:reply, err("rate_limited"), state}
 
@@ -240,7 +277,7 @@ defmodule Genswarms.Browse do
         sess = state.sessions[from].name
         r = state.renderer
         state = bump_rate(state, from)
-        display(:browse_dispatch, %{agent: from, act: desc})
+        display(:browser_dispatch, %{agent: from, act: desc})
         Logger.info("browse: from=#{from} act=#{desc} verdict=dispatched session=#{sess}")
         deliver(from, desc, render_sync(fn -> r.act(verb, arg, sess) end, state), full?, state)
     end
@@ -297,9 +334,9 @@ defmodule Genswarms.Browse do
   # browser is sitting on an off-cage page, and any further action would interact with
   # it.
   defp deliver(from, desc, {:ok, %{landed_url: landed, text: text}}, full?, state) do
-    case Browse.gate(landed, state.allowset, state.resolver) do
+    case Browse.gate(landed, state.policy, state.resolver) do
       :ok ->
-        display(:browse_done, %{agent: from, verdict: "ok"})
+        display(:browser_done, %{agent: from, verdict: "ok", host: host_of(landed)})
         Logger.info("browse: from=#{from} act=#{desc} landed=#{landed} verdict=ok full=#{full?}")
         state = touch_session(from, state)
         {clamped, truncated?} = clamp(text, state.max_text_chars)
@@ -308,14 +345,14 @@ defmodule Genswarms.Browse do
         {:reply, Jason.encode!(payload), state}
 
       {:error, reason} ->
-        display(:browse_done, %{agent: from, verdict: "escape_blocked"})
+        display(:browser_done, %{agent: from, verdict: "escape_blocked"})
         Logger.info("browse: from=#{from} act=#{desc} landed=#{landed} verdict=escape_blocked reason=#{inspect(reason)}")
         {:reply, err("blocked"), drop_session(from, state)}
     end
   end
 
   defp deliver(from, desc, {:error, reason}, _full?, state) do
-    display(:browse_done, %{agent: from, verdict: "render_failed"})
+    display(:browser_done, %{agent: from, verdict: "render_failed"})
     Logger.info("browse: from=#{from} act=#{desc} verdict=render_failed reason=#{inspect(reason)}")
     {:reply, err("render_failed"), state}
   end
@@ -431,7 +468,10 @@ defmodule Genswarms.Browse do
   end
 
   # ── helpers ──
-  defp load_allowlist(path) do
+  # Returns {:ok, MapSet} on a readable file (possibly empty), {:error, reason} if unreadable.
+  # The unreadable/empty distinction matters for denylist fail-closed (Task 4): an unreadable
+  # blocklist must NOT be treated as "nothing blocked".
+  defp load_hostset(path) do
     case File.read(path) do
       {:ok, body} ->
         set =
@@ -441,13 +481,17 @@ defmodule Genswarms.Browse do
           |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
           |> Enum.map(&String.downcase/1)
           |> MapSet.new()
-        if MapSet.size(set) == 0,
-          do: Logger.error("browse: allowlist #{path} is EMPTY — fail-closed, nothing will be fetched"),
-          else: Logger.info("browse: allowlist loaded from #{path} (#{MapSet.size(set)} hosts): #{Enum.join(Enum.sort(set), ", ")}")
-        set
+        {:ok, set}
+
       {:error, r} ->
-        Logger.error("browse: allowlist #{path} unreadable (#{inspect(r)}) — fail-closed, nothing will be fetched")
-        MapSet.new()
+        {:error, r}
+    end
+  end
+
+  defp host_of(url) do
+    case URI.parse(url) do
+      %URI{host: h} when is_binary(h) -> String.downcase(String.trim_trailing(h, "."))
+      _ -> nil
     end
   end
 

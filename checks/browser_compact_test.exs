@@ -16,7 +16,7 @@ ExUnit.start()
 # unique token PAST the head, plus the renderer's nav-link index appended at the tail
 # (the "--- Other links on this page ---" section browse must preserve for navigation).
 defmodule MockLong do
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
   @text "TITLE-Foo\n" <>
           String.duplicate("MAINBODY ", 50) <>
           "DEEPMARKER-past-the-head" <>
@@ -33,7 +33,7 @@ end
 
 # A page shorter than head_chars and with no nav index — the whole thing fits in head.
 defmodule MockShort do
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
   @text "tiny page, no nav, fits in head"
   def text, do: @text
   @impl true
@@ -44,9 +44,9 @@ defmodule MockShort do
   def close(_s), do: :ok
 end
 
-defmodule GenswarmsBrowseCompactTest do
+defmodule GenswarmsBrowserCompactTest do
   use ExUnit.Case, async: false
-  alias Genswarms.Browse
+  alias Genswarms.Browser
 
   @url "https://allowed.example.com/p"
 
@@ -56,7 +56,7 @@ defmodule GenswarmsBrowseCompactTest do
     on_exit(fn -> File.rm(allow) end)
 
     {:ok, st} =
-      Browse.init(%{
+      Browser.init(%{
         allowlist_path: allow,
         untrusted_tag: "rally_data",
         renderer: renderer,
@@ -71,7 +71,7 @@ defmodule GenswarmsBrowseCompactTest do
   end
 
   defp render(st, body \\ ~s({"action":"render","url":"#{@url}"})) do
-    {:reply, json, _st} = Browse.handle_message(:agentA, body, st)
+    {:reply, json, _st} = Browser.handle_message(:agentA, body, st)
     Jason.decode!(json)
   end
 
@@ -133,13 +133,13 @@ defmodule GenswarmsBrowseCompactTest do
   test "the full flag works on an interactive action too (click full:true)" do
     st = state_for(MockLong, 100)
     # one render establishes the per-asker session the click then acts on
-    st2 = elem(Browse.handle_message(:agentA, ~s({"action":"render","url":"#{@url}"}), st), 2)
+    st2 = elem(Browser.handle_message(:agentA, ~s({"action":"render","url":"#{@url}"}), st), 2)
 
-    m_compact = Browse.handle_message(:agentA, ~s({"action":"click","ref":"e5"}), st2) |> elem(1) |> Jason.decode!()
+    m_compact = Browser.handle_message(:agentA, ~s({"action":"click","ref":"e5"}), st2) |> elem(1) |> Jason.decode!()
     assert Map.has_key?(m_compact, "head")
     refute Map.has_key?(m_compact, "text")
 
-    m_full = Browse.handle_message(:agentA, ~s({"action":"click","ref":"e5","full":true}), st2) |> elem(1) |> Jason.decode!()
+    m_full = Browser.handle_message(:agentA, ~s({"action":"click","ref":"e5","full":true}), st2) |> elem(1) |> Jason.decode!()
     assert Map.has_key?(m_full, "text")
     assert m_full["text"] =~ "DEEPMARKER-past-the-head"
   end

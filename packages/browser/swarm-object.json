@@ -1,0 +1,4 @@
+{
+  "module": "Genswarms.Browser",
+  "files": ["browser_core.ex", "browser.ex"]
+}
