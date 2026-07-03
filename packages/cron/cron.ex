@@ -678,6 +678,15 @@ defmodule Genswarms.Cron do
       nil ->
         {:reply, Jason.encode!(%{ok: false, error: "job not found"}), state}
 
+      # Resume only acts on paused jobs. Resuming a RUNNING job used to
+      # double-fire it (running has next_run_at nil -> apply_resume_misfire
+      # read that as a missed occurrence and coalesce-armed `now` while the
+      # first occurrence was still in flight); resuming an ACTIVE job is
+      # meaningless. Contract: ok:false "job not paused" + the current state.
+      %{state: other} = _job when other != "paused" ->
+        {:reply, Jason.encode!(%{ok: false, error: "job not paused", job_id: id, state: other}),
+         state}
+
       job ->
         now = state.now_fn.()
 

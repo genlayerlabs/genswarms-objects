@@ -488,6 +488,61 @@ check.(
     job15.last_status == "ok"
 )
 
+# ── Vector 16 (I2): resume on a RUNNING job is rejected — no second concurrent launch ──
+
+{state16, clock16, sink16} = new_state_async.(base_now)
+
+{:reply, reply16, state16} = create.(state16, :ops, %{schedule: %{every_ms: 300_000}})
+job16_id = Jason.decode!(reply16)["job_id"]
+
+set_clock.(clock16, base_now + 300_000)
+{:reply, _tick16a, state16} = tick.(state16, :ops)
+tasks16_in_flight = map_size(state16.tasks)
+
+{:reply, resume16, state16} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job16_id}), state16)
+
+decoded_resume16 = Jason.decode!(resume16)
+
+{:reply, tick16b, state16} = tick.(state16, :ops)
+decoded_tick16b = Jason.decode!(tick16b)
+
+state16 = drain_task.(state16)
+job16 = Map.fetch!(state16.jobs, job16_id)
+
+check.(
+  "resume on a RUNNING job: rejected ok:false \"job not paused\", still one task in flight, no second launch, job re-arms normally after the result",
+  tasks16_in_flight == 1 and
+    decoded_resume16["ok"] == false and
+    decoded_resume16["error"] == "job not paused" and
+    decoded_resume16["state"] == "running" and
+    decoded_tick16b["launched"] == 0 and
+    length(sink_messages.(sink16)) == 1 and
+    job16.state == "active" and
+    job16.next_run_at == base_now + 600_000
+)
+
+# ── Vector 16b (I2): resume on an ACTIVE (never paused) job is a rejected no-op too ──
+
+{state16b, _clock16b, _sink16b} = new_state.(base_now)
+
+{:reply, reply16b, state16b} = create.(state16b, :ops, %{schedule: %{every_ms: 300_000}})
+job16b_id = Jason.decode!(reply16b)["job_id"]
+
+{:reply, resume16b, state16b} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job16b_id}), state16b)
+
+decoded_resume16b = Jason.decode!(resume16b)
+job16b = Map.fetch!(state16b.jobs, job16b_id)
+
+check.(
+  "resume on an ACTIVE job: rejected ok:false \"job not paused\", next_run_at untouched",
+  decoded_resume16b["ok"] == false and
+    decoded_resume16b["error"] == "job not paused" and
+    decoded_resume16b["state"] == "active" and
+    job16b.next_run_at == base_now + 300_000
+)
+
 failures = Agent.get(fails, &Enum.reverse/1)
 
 if failures == [] do
