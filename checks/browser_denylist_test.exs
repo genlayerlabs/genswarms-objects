@@ -61,4 +61,13 @@ defmodule BrowserDenylistObjectTest do
     assert {:allow, _} = st.policy
     assert is_binary(st.allowed_domains)
   end
+
+  test "open_with_retry omits --allowed-domains when allowed is nil" do
+    # capture the argv the adapter would build by stubbing cmd/1 is intrusive; instead assert
+    # the flag-assembly helper. Expose a private via a thin public wrapper for testing:
+    args_with = Genswarms.Browser.AgentBrowser.open_args("https://x.example/", "sess", "a.com,*.a.com")
+    args_nil  = Genswarms.Browser.AgentBrowser.open_args("https://x.example/", "sess", nil)
+    assert "--allowed-domains" in args_with
+    refute "--allowed-domains" in args_nil
+  end
 end

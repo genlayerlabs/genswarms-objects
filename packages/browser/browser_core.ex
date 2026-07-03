@@ -484,12 +484,25 @@ defmodule Genswarms.Browser.AgentBrowser do
       String.length(String.trim(out)) >= 200
   end
 
+  @doc false
+  # Build the `agent-browser open` argv. `allowed` is omitted (no `--allowed-domains`
+  # flag at all) when nil/blank — denylist mode has no allowlist string to pass, and
+  # agent-browser must not be handed an empty/garbage value for the flag.
+  @spec open_args(String.t(), String.t(), String.t() | nil) :: [String.t()]
+  def open_args(url, session, allowed) do
+    base = ["open", url]
+    domains = if is_binary(allowed) and allowed != "", do: ["--allowed-domains", allowed], else: []
+    base ++ domains ++ ["--session", session, "--json"]
+  end
+
   defp open_with_retry(url, allowed, session) do
-    case cmd(["open", url, "--allowed-domains", allowed, "--session", session, "--json"]) do
+    args = open_args(url, session, allowed)
+
+    case cmd(args) do
       {out, 0} -> {out, 0}
       {_, _} ->
         Process.sleep(600)
-        cmd(["open", url, "--allowed-domains", allowed, "--session", session, "--json"])
+        cmd(args)
     end
   end
 
