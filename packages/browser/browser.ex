@@ -1,4 +1,4 @@
-defmodule Genswarms.Browse do
+defmodule Genswarms.Browser do
   @moduledoc """
   Allowlist-capped web browser for the isolated agent. The agent drives a real
   (persistent) browser session through five actions — `render` (navigate to a URL),
@@ -25,7 +25,7 @@ defmodule Genswarms.Browse do
   snapshot, so every action returns a fresh one.
   """
   require Logger
-  alias Genswarms.Browse.Core, as: Browse
+  alias Genswarms.Browser.Core, as: Browse
 
   # Agent-supplied strings that become CLI argv (System.cmd: no shell, but keep the
   # contract tight anyway): refs are snapshot handles, keys are key/chord names.
@@ -37,7 +37,7 @@ defmodule Genswarms.Browse do
   # into ITS OWN global CLI flag when the text is a single, whitespace-free token
   # starting with `-` — e.g. text "--json" flips agent-browser's own output to JSON. The
   # audit's originally-suggested `--` argv terminator does NOT stop this (agent-browser
-  # ignores it — verified). System.cmd never invokes a shell (Genswarms.Browse.AgentBrowser
+  # ignores it — verified). System.cmd never invokes a shell (Genswarms.Browser.AgentBrowser
   # .cmd/1), so every element of the args list is passed as one exact, unsplit OS argv
   # entry: verb_args(:type, …) (browse_core.ex) hands `text` through WHOLE as a single
   # element, so text WITH internal whitespace ("-- hello world") can never be re-split
@@ -51,7 +51,7 @@ defmodule Genswarms.Browse do
   @flag_shaped_type_re ~r/\A-\S*\z/
 
   # A compact reply truncates the page's main BODY to a head but KEEPS the nav-link index
-  # the renderer appends to the page text under this header (Genswarms.Browse.AgentBrowser.
+  # the renderer appends to the page text under this header (Genswarms.Browser.AgentBrowser.
   # nav_section/2). Splitting on it lets the agent still navigate (the "couldn't reach
   # GenVM" incident was exactly the nav index going missing) while the bulky body stays out
   # of context. Must match that header; the live test (tests/browse_live.exs §3c) pins the
@@ -65,8 +65,8 @@ defmodule Genswarms.Browse do
              Path.join(File.cwd!(), "config/browse-allowlist.txt")
     allowset = load_allowlist(path)
 
-    renderer = Map.get(config, :renderer, Genswarms.Browse.AgentBrowser)
-    if renderer == Genswarms.Browse.AgentBrowser and System.find_executable("agent-browser") == nil,
+    renderer = Map.get(config, :renderer, Genswarms.Browser.AgentBrowser)
+    if renderer == Genswarms.Browser.AgentBrowser and System.find_executable("agent-browser") == nil,
       do: Logger.error("browse: `agent-browser` not on PATH — render requests will fail with render_failed. Install: brew install agent-browser && agent-browser install")
 
     {:ok,
@@ -167,7 +167,7 @@ defmodule Genswarms.Browse do
   defp do_render(from, url, full?, state) do
     cond do
       over_rate?(from, state) ->
-        display(:browse_done, %{agent: from, verdict: "rate_limited"})
+        display(:browser_done, %{agent: from, verdict: "rate_limited"})
         Logger.info("browse: from=#{from} url=#{url} verdict=rate_limited")
         {:reply, err("rate_limited"), state}
 
@@ -188,12 +188,12 @@ defmodule Genswarms.Browse do
           {sess, state} = ensure_session(from, state)
           r = state.renderer
           ad = state.allowed_domains
-          display(:browse_dispatch, %{agent: from, url: url})
+          display(:browser_dispatch, %{agent: from, url: url})
           Logger.info("browse: from=#{from} url=#{url} resolved=#{final} verdict=dispatched session=#{sess}")
           deliver(from, "render #{url}", render_sync(fn -> r.navigate(final, sess, ad) end, state), full?, state)
         else
           {:error, {:not_allowed, _}} ->
-            display(:browse_done, %{agent: from, verdict: "not_allowed"})
+            display(:browser_done, %{agent: from, verdict: "not_allowed"})
             Logger.info("browse: from=#{from} url=#{url} verdict=not_allowed")
             {:reply, err("not_allowed"), state}
 
@@ -202,12 +202,12 @@ defmodule Genswarms.Browse do
           # 2026-06-10: a 404'd docs page reported as blocked → the agent fabricated
           # the page's content instead of saying it couldn't be loaded).
           {:error, {:http_status, s}} ->
-            display(:browse_done, %{agent: from, verdict: "render_failed"})
+            display(:browser_done, %{agent: from, verdict: "render_failed"})
             Logger.info("browse: from=#{from} url=#{url} verdict=render_failed reason=http_#{s}")
             {:reply, err("render_failed"), state}
 
           {:error, reason} ->
-            display(:browse_done, %{agent: from, verdict: "blocked"})
+            display(:browser_done, %{agent: from, verdict: "blocked"})
             Logger.info("browse: from=#{from} url=#{url} verdict=blocked reason=#{inspect(reason)}")
             {:reply, err("blocked"), state}
         end
@@ -217,22 +217,22 @@ defmodule Genswarms.Browse do
   defp do_act(from, verb, arg, desc, full?, state) do
     cond do
       not Map.has_key?(state.sessions, from) ->
-        display(:browse_done, %{agent: from, verdict: "no_session"})
+        display(:browser_done, %{agent: from, verdict: "no_session"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=no_session")
         {:reply, err("no_session — render a page first"), state}
 
       verb == :type and flag_shaped_type?(arg.text) ->
-        display(:browse_done, %{agent: from, verdict: "flag_shaped_text"})
+        display(:browser_done, %{agent: from, verdict: "flag_shaped_text"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=flag_shaped_text")
         {:reply, err("bad_arg — type text can't be a single '-'-leading word (it looks like a CLI flag); add a space or another word"), state}
 
       not valid_arg?(verb, arg) ->
-        display(:browse_done, %{agent: from, verdict: "bad_arg"})
+        display(:browser_done, %{agent: from, verdict: "bad_arg"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=bad_arg")
         {:reply, err("bad_arg"), state}
 
       over_rate?(from, state) ->
-        display(:browse_done, %{agent: from, verdict: "rate_limited"})
+        display(:browser_done, %{agent: from, verdict: "rate_limited"})
         Logger.info("browse: from=#{from} act=#{desc} verdict=rate_limited")
         {:reply, err("rate_limited"), state}
 
@@ -240,7 +240,7 @@ defmodule Genswarms.Browse do
         sess = state.sessions[from].name
         r = state.renderer
         state = bump_rate(state, from)
-        display(:browse_dispatch, %{agent: from, act: desc})
+        display(:browser_dispatch, %{agent: from, act: desc})
         Logger.info("browse: from=#{from} act=#{desc} verdict=dispatched session=#{sess}")
         deliver(from, desc, render_sync(fn -> r.act(verb, arg, sess) end, state), full?, state)
     end
@@ -299,7 +299,7 @@ defmodule Genswarms.Browse do
   defp deliver(from, desc, {:ok, %{landed_url: landed, text: text}}, full?, state) do
     case Browse.gate(landed, state.allowset, state.resolver) do
       :ok ->
-        display(:browse_done, %{agent: from, verdict: "ok"})
+        display(:browser_done, %{agent: from, verdict: "ok"})
         Logger.info("browse: from=#{from} act=#{desc} landed=#{landed} verdict=ok full=#{full?}")
         state = touch_session(from, state)
         {clamped, truncated?} = clamp(text, state.max_text_chars)
@@ -308,14 +308,14 @@ defmodule Genswarms.Browse do
         {:reply, Jason.encode!(payload), state}
 
       {:error, reason} ->
-        display(:browse_done, %{agent: from, verdict: "escape_blocked"})
+        display(:browser_done, %{agent: from, verdict: "escape_blocked"})
         Logger.info("browse: from=#{from} act=#{desc} landed=#{landed} verdict=escape_blocked reason=#{inspect(reason)}")
         {:reply, err("blocked"), drop_session(from, state)}
     end
   end
 
   defp deliver(from, desc, {:error, reason}, _full?, state) do
-    display(:browse_done, %{agent: from, verdict: "render_failed"})
+    display(:browser_done, %{agent: from, verdict: "render_failed"})
     Logger.info("browse: from=#{from} act=#{desc} verdict=render_failed reason=#{inspect(reason)}")
     {:reply, err("render_failed"), state}
   end

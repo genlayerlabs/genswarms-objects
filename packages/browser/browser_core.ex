@@ -1,4 +1,4 @@
-defmodule Genswarms.Browse.Core do
+defmodule Genswarms.Browser.Core do
   @moduledoc """
   Promotable core for the allowlist-capped web browser. No wingston/campaign
   concept — could move to `Genswarms.Browse` unchanged.
@@ -209,11 +209,11 @@ defmodule Genswarms.Browse.Core do
   end
 end
 
-defmodule Genswarms.Browse.Renderer do
+defmodule Genswarms.Browser.Renderer do
   @moduledoc """
   Swappable renderer with a PERSISTENT session: `navigate/3` opens a URL in the named
   session and leaves it open; `act/3` interacts with the live page (click/back/type/
-  press); `close/1` ends the session. Default impl: `Genswarms.Browse.AgentBrowser`.
+  press); `close/1` ends the session. Default impl: `Genswarms.Browser.AgentBrowser`.
 
   Every callback that touches the page returns the LANDED url so the object can re-gate
   it — measured against agent-browser 0.27.1: the `--allowed-domains` cage gates `open`
@@ -230,7 +230,7 @@ defmodule Genswarms.Browse.Renderer do
   @callback close(session :: String.t()) :: :ok
 end
 
-defmodule Genswarms.Browse.AgentBrowser do
+defmodule Genswarms.Browser.AgentBrowser do
   @moduledoc """
   agent-browser adapter over a persistent named session. Snapshots are taken with
   `--urls` (links carry their absolute hrefs — without this the agent cannot navigate
@@ -256,7 +256,7 @@ defmodule Genswarms.Browse.AgentBrowser do
   `cmd/1` uses System.cmd (argv, no shell), so there is no shell injection surface
   either way.
   """
-  @behaviour Genswarms.Browse.Renderer
+  @behaviour Genswarms.Browser.Renderer
 
   @bin "agent-browser"
   # Main content is far smaller than the old full-page snapshot (the intro article is
