@@ -5,7 +5,7 @@ swarms — one lockstep monorepo, three swarmidx packages (`kind: handler`):
 
 | Package | Object | What it does |
 |---|---|---|
-| `cron` (`packages/cron`) | `Genswarms.Cron` | Deterministic global scheduler: a job = one due datetime + one stamped message to one **allowlisted** target. Trust-gated sources, retry/backoff, bounded concurrency, persistence via injectable store. |
+| `cron` (`packages/cron`) | `Genswarms.Cron` | Deterministic global scheduler: a job = one due datetime + one stamped message to one **allowlisted** target. One-shot, fixed-rate, and cron-expression schedules; declarative seed_jobs; consecutive-failure breaker. Trust-gated sources, retry/backoff, bounded concurrency, persistence via injectable store. |
 | `browse` (`packages/browse`) | `Genswarms.Browse` | Allowlist-capped web browser for agents (render/click/type/back). Compact replies by default (head + nav-link index — the full page never re-enters agent context unless asked); off-cage redirect containment (re-gate on settle, session destroyed on escape). |
 | `metrics` (`packages/metrics`) | `Genswarms.Metrics` | Fire-and-forget counters: closed key allowlist (a prompt-injected agent can't mint unbounded keys), in-memory totals, periodic flush to an injectable durable store. |
 
