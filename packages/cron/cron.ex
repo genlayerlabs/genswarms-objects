@@ -50,6 +50,7 @@ defmodule Genswarms.Cron do
       retry_backoff_ms: Map.get(config, :retry_backoff_ms, 60_000),
       async?: Map.get(config, :async?, true),
       min_period_ms: Map.get(config, :min_period_ms, 60_000),
+      breaker_threshold: Map.get(config, :breaker_threshold, 5),
       jobs: jobs,
       tasks: %{},
       next_id: max(store_call(store_mod, :max_cron_job_id, [], 0) + 1, next_memory_id(jobs)),
@@ -232,6 +233,7 @@ defmodule Genswarms.Cron do
          attempts: 0,
          max_attempts: positive_int(msg["max_attempts"], state.max_attempts),
          retry_backoff_ms: nonnegative_int(msg["retry_backoff_ms"], state.retry_backoff_ms),
+         breaker_threshold: positive_int(msg["breaker_threshold"], state.breaker_threshold),
          origin: normalize_origin(msg["origin"], from),
          payload: payload,
          context_from: normalize_context_from(msg["context_from"]),
@@ -333,7 +335,11 @@ defmodule Genswarms.Cron do
       job
       | last_run_at: now,
         next_run_at: nil,
-        claimed_due: job.next_run_at,
+        # A retry claim's next_run_at is the backoff timestamp, not the occurrence's
+        # true due point — keep the original due (set at the first claim of this
+        # occurrence) alive across retry cycles so a later success re-arms off the
+        # grid, not off the backoff time. Cleared on success/exhaustion (complete_job).
+        claimed_due: job.claimed_due || job.next_run_at,
         state: "running",
         attempts: Map.get(job, :attempts, 0) + 1,
         updated_at: now
@@ -449,23 +455,54 @@ defmodule Genswarms.Cron do
   end
 
   defp complete_job(job, result, now) do
-    attempts = Map.get(job, :attempts, 1)
-    max_attempts = Map.get(job, :max_attempts, 3)
-
-    if attempts < max_attempts do
+    if job.attempts < job.max_attempts do
       %{
         job
         | state: "active",
-          next_run_at: now + retry_delay(job, attempts),
+          next_run_at: now + retry_delay(job, job.attempts),
           last_status: result.status,
           last_error: result.error,
           updated_at: now
       }
     else
+      exhausted(job, result, now)
+    end
+  end
+
+  # Occurrence-scoped exhaustion (attempts hit max_attempts with no success).
+  # Recurring: bump consecutive_failures; the breaker (>= breaker_threshold) pauses
+  # the job (paused_by "breaker") instead of re-arming it. Below the breaker, the
+  # occurrence still moves on to the next grid point (Schedule.next_after from the
+  # ORIGINAL claimed_due, not `now` — the retry-grid fix in claim_job keeps that due
+  # point stable across the whole retry cycle). One-shot: terminal "failed" (0.1.1).
+  defp exhausted(job, result, now) do
+    if Schedule.recurring?(job.schedule) do
+      cf = (job.consecutive_failures || 0) + 1
+
+      base = %{
+        job
+        | attempts: 0,
+          consecutive_failures: cf,
+          claimed_due: nil,
+          last_status: result.status,
+          last_error: result.error,
+          updated_at: now
+      }
+
+      if cf >= job.breaker_threshold do
+        %{base | state: "paused", paused_by: "breaker", next_run_at: nil}
+      else
+        case Schedule.next_after(job.schedule, job.claimed_due || now, now) do
+          {:ok, next} -> %{base | state: "active", next_run_at: next}
+          :none -> %{base | state: "failed", next_run_at: nil}
+        end
+      end
+    else
       %{
         job
         | state: "failed",
           next_run_at: nil,
+          claimed_due: nil,
           last_status: result.status,
           last_error: result.error,
           updated_at: now
@@ -509,7 +546,10 @@ defmodule Genswarms.Cron do
 
       job ->
         now = state.now_fn.()
-        job = %{job | state: "active", updated_at: now}
+
+        job =
+          %{job | state: "active", paused_by: nil, consecutive_failures: 0, updated_at: now}
+          |> apply_resume_misfire(now)
 
         if job.next_run_at do
           state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
@@ -518,6 +558,33 @@ defmodule Genswarms.Cron do
         else
           {:reply, Jason.encode!(%{ok: false, error: "job has no future run_at"}), state}
         end
+    end
+  end
+
+  # Every resume clears the breaker (paused_by/consecutive_failures). For recurring
+  # jobs whose due point was missed (next_run_at nil — e.g. breaker-paused — or now
+  # in the past because the pause spanned occurrences), apply the job's misfire
+  # policy: "skip" jumps to the next FUTURE grid point (no catch-up delivery);
+  # otherwise ("coalesce") fires once, immediately. A recurring job whose next_run_at
+  # is still in the future is left alone (resuming early shouldn't fire it early).
+  # One-shot jobs with a nil next_run_at keep 0.1.1 behavior (untouched -> the
+  # caller's "job has no future run_at" reply).
+  defp apply_resume_misfire(job, now) do
+    missed? = is_nil(job.next_run_at) or job.next_run_at <= now
+
+    if missed? and Schedule.recurring?(job.schedule) do
+      case job.misfire do
+        "skip" ->
+          case Schedule.next_after(job.schedule, job.last_run_at || job.created_at, now) do
+            {:ok, next} -> %{job | next_run_at: next}
+            :none -> %{job | next_run_at: nil}
+          end
+
+        _coalesce ->
+          %{job | next_run_at: now}
+      end
+    else
+      job
     end
   end
 
@@ -655,11 +722,34 @@ defmodule Genswarms.Cron do
 
   defp normalize_context_from(_), do: []
 
+  # Boot-time recovery: any job found "running" (crashed mid-claim) is re-armed.
+  # One-shot: unchanged from 0.1.1 (fires again immediately). Recurring: apply the
+  # same misfire policy as a manual resume (coalesce -> now, skip -> the next future
+  # grid point) — the job's misfire field isn't backfilled by atomize_known yet
+  # (Task 7), so it's read defensively and defaults to "coalesce" until then.
   defp recover_running_job(%{state: "running"} = job, now) do
+    schedule = Map.get(job, :schedule)
+
+    next_run_at =
+      if Schedule.recurring?(schedule) do
+        case Map.get(job, :misfire, "coalesce") do
+          "skip" ->
+            case Schedule.next_after(schedule, job.last_run_at || job.created_at, now) do
+              {:ok, next} -> next
+              :none -> now
+            end
+
+          _coalesce ->
+            now
+        end
+      else
+        now
+      end
+
     %{
       job
       | state: "active",
-        next_run_at: now,
+        next_run_at: next_run_at,
         last_status: "recovered",
         last_error: "scheduler restarted while job was running",
         updated_at: now
