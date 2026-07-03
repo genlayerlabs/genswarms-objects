@@ -62,6 +62,11 @@ check.("one-shots have no next; recurring? flags kinds",
   Schedule.next_after(oneshot, now, now) == :none and
   not Schedule.recurring?(oneshot) and Schedule.recurring?(every5) and Schedule.recurring?(hourly))
 
+check.("degenerate persisted every_ms never crashes or fires into the past",
+  Schedule.next_after(%{"kind" => "every_ms", "every_ms" => 0}, now, now + 1) == :none and
+  Schedule.next_after(%{"kind" => "every_ms", "every_ms" => -5}, now, now + 1) == :none and
+  Schedule.first_run_at(%{"kind" => "every_ms", "every_ms" => 0}, now) == {:error, "invalid schedule"})
+
 check.("legacy datetime parse/1 still rejects cron strings (0.1.1 vector holds)",
   match?({:error, _}, Schedule.parse("0 9 * * *")))
 

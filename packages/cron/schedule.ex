@@ -101,15 +101,19 @@ defmodule Genswarms.Cron.Schedule do
   def recurring?(_), do: false
 
   def first_run_at(%{"kind" => "run_at", "run_at_ms" => ms}, _created), do: {:ok, ms}
-  def first_run_at(%{"kind" => "every_ms", "every_ms" => n}, created), do: {:ok, created + n}
+  def first_run_at(%{"kind" => "every_ms", "every_ms" => n}, created)
+      when is_integer(n) and n > 0 and is_integer(created),
+      do: {:ok, created + n}
 
   def first_run_at(%{"kind" => "cron", "expr" => expr}, created) do
     with {:ok, parsed} <- CronExpr.parse(expr), do: satisfiable(parsed, created)
   end
 
+  def first_run_at(_norm, _created), do: {:error, "invalid schedule"}
+
   @doc "The grid rule: smallest scheduled point strictly after now (spec-pinned)."
   def next_after(%{"kind" => "every_ms", "every_ms" => n}, due, now)
-      when is_integer(due) and is_integer(now) do
+      when is_integer(due) and is_integer(now) and is_integer(n) and n > 0 do
     {:ok, due + (div(max(now - due, 0), n) + 1) * n}
   end
 
