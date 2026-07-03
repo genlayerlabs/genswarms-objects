@@ -4,7 +4,7 @@ defmodule GenswarmsObjects.MixProject do
   def project do
     [
       app: :genswarms_objects,
-      version: "0.1.3",
+      version: "0.1.4",
       elixir: "~> 1.14",
       elixirc_paths: ["packages"],
       start_permanent: Mix.env() == :prod,

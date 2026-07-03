@@ -31,16 +31,17 @@ description: >-
 
 ```
 {"action":"draw","recipient_id":"tg:1:0","date":"2026-07-03"}
-  -> {"ok":true,"text":"Coo coo: Tip body. Fly high.","fragment_ids":["a1b2..."]}
+  -> {"ok":true,"text":"Coo coo: Tip body. Fly high.","fragment_ids":["a1b2..."],"recipient_id":"tg:1:0","date":"2026-07-03"}
 send the text (your transport, your consent gates)
 {"action":"commit","recipient_id":"tg:1:0","fragment_ids":["a1b2..."]}
-  -> {"ok":true,"reshuffled":false}
+  -> {"ok":true,"reshuffled":false,"recipient_id":"tg:1:0"}
 ```
 
 - `draw` is a PURE seeded read: same (recipient, date) => the same message,
   so a crash between draw and send retries identically. It marks nothing.
+  Replies echo `recipient_id` and `date` for async correlation.
 - `commit` only after a delivery ATTEMPT (sent or failed) — the same
-  mark-after-attempt discipline as roster-style targeting.
+  mark-after-attempt discipline as roster-style targeting. Replies echo `recipient_id`.
 - The object makes NO trust decisions: recipient selection, consent, opt-out,
   and rate limits are YOUR job before draw. Keep it topology-internal, not
   agent-callable.
