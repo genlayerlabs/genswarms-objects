@@ -257,10 +257,26 @@ defmodule Genswarms.Cron do
   defp apply_seeds(state, [], _now), do: state
 
   defp apply_seeds(state, seeds, now) do
-    Enum.reduce(seeds, state, fn seed, st -> apply_seed(st, seed, now) end)
+    # Terminal rows are not loaded (@load_states), so the in-memory dedupe
+    # cannot see a one-shot seed that already ran to done/failed (or was
+    # deleted) — it would be re-created with the past-guard skipped and fire
+    # again on every boot, accreting duplicate rows. Consult the store once
+    # for terminal dedupe_keys; a one-shot seed with a terminal row is a no-op.
+    terminal_keys =
+      store_call(state.store_mod, :load_cron_jobs, [@terminal_states], [])
+      |> Enum.map(&terminal_dedupe_key/1)
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
+
+    Enum.reduce(seeds, state, fn seed, st -> apply_seed(st, seed, now, terminal_keys) end)
   end
 
-  defp apply_seed(state, seed, now) do
+  defp terminal_dedupe_key(%{data: %{"dedupe_key" => dk}}) when is_binary(dk) and dk != "",
+    do: dk
+
+  defp terminal_dedupe_key(_row), do: nil
+
+  defp apply_seed(state, seed, now, terminal_keys) do
     dk = seed[:dedupe_key] || seed["dedupe_key"]
 
     if dk in [nil, ""] do
@@ -286,31 +302,43 @@ defmodule Genswarms.Cron do
     with {:ok, norm} <- Schedule.normalize(msg["schedule"], now),
          :ok <- check_floor(norm, state),
          {:ok, _payload} <- normalize_payload(msg, state) do
-      upsert_seed(state, msg, norm, now)
+      upsert_seed(state, msg, norm, now, terminal_keys)
     else
       {:error, reason} ->
         raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
     end
   end
 
-  defp upsert_seed(state, msg, norm, now) do
+  defp upsert_seed(state, msg, norm, now, terminal_keys) do
     case existing_dedupe_job(state, msg["dedupe_key"]) do
       nil ->
-        case build_job("seed", msg, norm, state, now) do
-          {:ok, job} ->
-            %{
-              state
-              | jobs: Map.put(state.jobs, job.id, job),
-                next_id: max(state.next_id, job.id + 1)
-            }
-            |> persist_job(job)
-
-          {:error, reason} ->
-            raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
+        # One-shot seed whose dedupe_key already has a terminal store row:
+        # it ran (or was deleted) — never resurrect/re-fire it (I4). Recurring
+        # seeds keep declarative semantics: the config says they should exist.
+        if norm["kind"] == "run_at" and
+             MapSet.member?(terminal_keys, safe_optional(msg["dedupe_key"], 200)) do
+          state
+        else
+          insert_seed_job(state, msg, norm, now)
         end
 
       job ->
         update_seed_job(state, job, msg, norm, now)
+    end
+  end
+
+  defp insert_seed_job(state, msg, norm, now) do
+    case build_job("seed", msg, norm, state, now) do
+      {:ok, job} ->
+        %{
+          state
+          | jobs: Map.put(state.jobs, job.id, job),
+            next_id: max(state.next_id, job.id + 1)
+        }
+        |> persist_job(job)
+
+      {:error, reason} ->
+        raise ArgumentError, "invalid cron seed #{inspect(msg["name"])}: #{reason}"
     end
   end
 

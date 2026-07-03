@@ -34,7 +34,10 @@ defmodule FakeStore do
       else: Agent.start_link(fn -> rows end, name: __MODULE__)
   end
 
-  def load_cron_jobs(_states), do: Agent.get(__MODULE__, & &1)
+  # Honors the states filter like the real store seam: load_cron_jobs(states)
+  # returns only rows whose state is in the list.
+  def load_cron_jobs(states),
+    do: Agent.get(__MODULE__, & &1) |> Enum.filter(&(&1.state in states))
   def max_cron_job_id, do: Agent.get(__MODULE__, &Enum.reduce(&1, 0, fn r, m -> max(r.id, m) end))
 
   def save_cron_job(job) do
@@ -343,6 +346,35 @@ check.(
      end) and
     row8 != nil and
     String.contains?(row8.data["last_error"] || "", "cron")
+)
+
+# ── Vector 9 (I4): a one-shot seed that already ran to a terminal row is a no-op on reboot ──
+# The terminal row isn't loaded (@load_states), so the in-memory dedupe can't see
+# it — the seed upsert must consult the STORE for terminal rows by dedupe_key.
+
+FakeStore.start([])
+
+oneshot_seeds = [
+  %{name: "once", dedupe_key: "seed:once", schedule: %{"run_at" => base_now - 3_600_000}, target: "proactive", message: %{"action" => "run"}}
+]
+
+{state9a, _clock9a, sink9a} = init_state.(base_now, oneshot_seeds, %{store_mod: FakeStore})
+{:reply, _tick9a, _state9a} = tick.(state9a, :ops)
+deliveries9_boot1 = length(Agent.get(sink9a, & &1))
+rows9_boot1 = Agent.get(FakeStore, & &1)
+
+{state9b, _clock9b, sink9b} = init_state.(base_now + 60_000, oneshot_seeds, %{store_mod: FakeStore})
+{:reply, _tick9b, _state9b} = tick.(state9b, :ops)
+deliveries9_boot2 = length(Agent.get(sink9b, & &1))
+rows9_boot2 = Agent.get(FakeStore, & &1)
+
+check.(
+  "one-shot past seed fires exactly once across reboots: boot1 delivers 1 and lands one done row; boot2 delivers 0, creates no job and no duplicate row",
+  deliveries9_boot1 == 1 and
+    length(rows9_boot1) == 1 and hd(rows9_boot1).state == "done" and
+    deliveries9_boot2 == 0 and
+    map_size(state9b.jobs) == 0 and
+    length(rows9_boot2) == 1
 )
 
 failures = Agent.get(fails, &Enum.reverse/1)
