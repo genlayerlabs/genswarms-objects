@@ -48,8 +48,14 @@ defmodule Genswarms.Tips.Core do
       fragment of that kind is weight ≤ 0 — then falls back to uniform;
       picking something beats silence). Empty pool or empty text contributes
       nothing.
+
+  `category` (optional, default `nil`) narrows `rotate: true` slots' pool to
+  fragments tagged with that category BEFORE seen-filtering; an empty result
+  (unknown category, or no fragment of that kind carries it) falls back to
+  the full kind pool rather than erroring. `rotate: false` slots ignore it.
+  `nil` (the default) is byte-identical to the pre-category draw/7 behavior.
   """
-  def draw(fragments, seen, template, recipient_id, date, salt, guard) do
+  def draw(fragments, seen, template, recipient_id, date, salt, guard, category \\ nil) do
     live = Enum.filter(fragments, &(&1.status == "live"))
     seen_list = Map.get(seen, recipient_id, [])
     rng = seed(recipient_id, date, salt)
@@ -58,6 +64,7 @@ defmodule Genswarms.Tips.Core do
     |> Enum.reduce_while({:ok, [], [], rng}, fn slot, {:ok, parts, rot_ids, rng} ->
       # sort_by id: the draw must not depend on store return order
       pool = live |> Enum.filter(&(&1.kind == slot.kind)) |> Enum.sort_by(& &1.id)
+      pool = if slot.rotate, do: narrow_by_category(pool, category), else: pool
 
       case pick(slot, pool, seen_list, guard, rng) do
         {:error, :empty_pool} ->
@@ -83,6 +90,18 @@ defmodule Genswarms.Tips.Core do
   end
 
   # ── selection internals ──────────────────────────────────────────────────
+
+  # nil category = no filter (today's behavior). A non-nil category that
+  # matches nothing in this kind's live pool degrades to the unfiltered
+  # pool — a bad/absent category tag must never turn into empty_pool.
+  defp narrow_by_category(pool, nil), do: pool
+
+  defp narrow_by_category(pool, category) do
+    case Enum.filter(pool, &(&1.category == category)) do
+      [] -> pool
+      filtered -> filtered
+    end
+  end
 
   defp pick(%{rotate: false}, [], _seen, _guard, rng), do: {nil, rng}
   defp pick(%{rotate: false}, pool, _seen, _guard, rng), do: weighted(pool, rng)

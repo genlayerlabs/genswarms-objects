@@ -237,3 +237,121 @@ defmodule TipsObjectDrawCommitTest do
     assert r["fragment_ids"] == [b3.id]
   end
 end
+
+defmodule TipsObjectTrustGateTest do
+  use ExUnit.Case, async: false
+  alias Genswarms.Tips
+  alias Genswarms.Tips.Core
+
+  defp send!(from, state, msg) do
+    {:reply, reply, state} = Tips.handle_message(from, Jason.encode!(msg), state)
+    {Jason.decode!(reply), state}
+  end
+
+  defp live_bodies do
+    [
+      Core.fragment("body", "Hook tip.", status: "live", category: "hooks"),
+      Core.fragment("body", "Other tip.", status: "live")
+    ]
+  end
+
+  test "no trusted_sources config (absent): every sender keeps the full action surface — back-compat pin" do
+    {:ok, state} = Tips.init(%{})
+    assert state.trusted_sources == nil
+
+    for from <- [:some_agent, :"weird atom", "a-string-sender"] do
+      {r, state} =
+        send!(from, state, %{
+          "action" => "add_fragments",
+          "fragments" => [%{"kind" => "body", "text" => "hi from #{inspect(from)}."}]
+        })
+      assert r["ok"] == true
+
+      ids = Enum.map(state.fragments, & &1.id)
+      {r, state} = send!(from, state, %{"action" => "promote", "ids" => ids})
+      assert r["ok"] == true
+
+      {r, state} = send!(from, state, %{"action" => "commit", "recipient_id" => "r", "fragment_ids" => []})
+      assert r["ok"] == true
+
+      {r, _state} = send!(from, state, %{"action" => "retire", "ids" => ids})
+      assert r["ok"] == true
+    end
+  end
+
+  test "trusted_sources set: untrusted sender's draw is open, every mutating action replies untrusted" do
+    {:ok, state} =
+      Tips.init(%{trusted_sources: [:ops], template: [%{kind: "body", rotate: true}]})
+
+    state = %{state | fragments: live_bodies()}
+
+    {r, _} =
+      send!(:agent, state, %{"action" => "draw", "recipient_id" => "tg:1:0", "date" => "2026-07-03"})
+    assert r["ok"] == true
+
+    [frag_id | _] = Enum.map(state.fragments, & &1.id)
+
+    for msg <- [
+          %{"action" => "add_fragments", "fragments" => [%{"kind" => "body", "text" => "x"}]},
+          %{"action" => "promote", "ids" => [frag_id]},
+          %{"action" => "retire", "ids" => [frag_id]},
+          %{"action" => "commit", "recipient_id" => "tg:1:0", "fragment_ids" => [frag_id]},
+          %{"action" => "stats"}
+        ] do
+      {r, _} = send!(:agent, state, msg)
+      assert r == %{"ok" => false, "error" => "untrusted"}
+    end
+
+    # trusted sender (atom or string form — compared as strings) keeps full access
+    {r, _} =
+      send!(:ops, state, %{
+        "action" => "add_fragments",
+        "fragments" => [%{"kind" => "body", "text" => "trusted add via atom."}]
+      })
+    assert r["ok"] == true
+
+    {r, _} =
+      send!("ops", state, %{
+        "action" => "add_fragments",
+        "fragments" => [%{"kind" => "body", "text" => "trusted add via string."}]
+      })
+    assert r["ok"] == true
+  end
+
+  test "custom open_actions widens what an untrusted sender may do" do
+    {:ok, state} =
+      Tips.init(%{
+        trusted_sources: [:ops],
+        open_actions: ["draw", "stats"],
+        template: [%{kind: "body", rotate: true}]
+      })
+
+    state = %{state | fragments: live_bodies()}
+
+    {r, _} = send!(:agent, state, %{"action" => "stats"})
+    assert r["ok"] == true
+
+    {r, _} = send!(:agent, state, %{"action" => "promote", "ids" => []})
+    assert r == %{"ok" => false, "error" => "untrusted"}
+  end
+
+  test "draw's optional category round-trips in the ok reply only when supplied" do
+    {:ok, state} = Tips.init(%{template: [%{kind: "body", rotate: true}]})
+    state = %{state | fragments: live_bodies()}
+
+    {r, _} =
+      send!(:x, state, %{
+        "action" => "draw",
+        "recipient_id" => "tg:1:0",
+        "date" => "2026-07-03",
+        "category" => "hooks"
+      })
+    assert r["ok"] == true
+    assert r["category"] == "hooks"
+
+    {r2, _} =
+      send!(:x, state, %{"action" => "draw", "recipient_id" => "tg:1:0", "date" => "2026-07-03"})
+    assert r2["ok"] == true
+    refute Map.has_key?(r2, "category")
+  end
+end
