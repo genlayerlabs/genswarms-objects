@@ -177,3 +177,53 @@ defmodule TipsCoreCommitTest do
     refute picked == List.last(ids)
   end
 end
+
+defmodule TipsCoreCategoryTest do
+  use ExUnit.Case, async: false
+  alias Genswarms.Tips.Core
+
+  @template [
+    %{kind: "opener", rotate: false},
+    %{kind: "body", rotate: true},
+    %{kind: "closer", rotate: false}
+  ]
+
+  defp pool do
+    [
+      Core.fragment("opener", "Coo:", status: "live"),
+      Core.fragment("body", "Hook tip.", status: "live", category: "hooks"),
+      Core.fragment("body", "Craft tip.", status: "live", category: "craft"),
+      Core.fragment("body", "Thread tip.", status: "live", category: "threads"),
+      Core.fragment("closer", "", status: "live", weight: 1)
+    ]
+  end
+
+  test "category narrows the rotating pool to matching fragments before seen-filtering" do
+    for d <- 1..20 do
+      {:ok, %{rotating_ids: [id]}} =
+        Core.draw(pool(), %{}, @template, "tg:1:0", "2026-07-#{d}", "s", 20, "hooks")
+      frag = Enum.find(pool(), &(&1.id == id))
+      assert frag.category == "hooks"
+    end
+  end
+
+  test "unknown category falls back to the full pool — never errors" do
+    {:ok, %{rotating_ids: [id]}} =
+      Core.draw(pool(), %{}, @template, "tg:1:0", "2026-07-03", "s", 20, "does-not-exist")
+    frag = Enum.find(pool(), &(&1.id == id))
+    assert frag.kind == "body"
+  end
+
+  test "nil category is byte-identical to today's draw/7 behavior (back-compat pin)" do
+    a = Core.draw(pool(), %{}, @template, "tg:1:0", "2026-07-03", "s", 20)
+    b = Core.draw(pool(), %{}, @template, "tg:1:0", "2026-07-03", "s", 20, nil)
+    assert a == b
+
+    # across many dates, not just one lucky draw
+    for d <- 1..15 do
+      date = "2026-06-#{d}"
+      assert Core.draw(pool(), %{}, @template, "tg:1:0", date, "s", 20) ==
+               Core.draw(pool(), %{}, @template, "tg:1:0", date, "s", 20, nil)
+    end
+  end
+end

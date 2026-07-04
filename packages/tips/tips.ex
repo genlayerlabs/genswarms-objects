@@ -12,9 +12,17 @@ defmodule Genswarms.Tips do
   `promote` -> `"live"` (the only drawable status), `retire` -> `"retired"`
   (never deleted; a retired id stays in seen-state).
 
-  The object makes NO trust decisions: recipient selection, consent, and rate
-  limits belong to the caller (in wingston: roster). Wire it behind the swarm
-  topology, not agent-callable.
+  The object makes NO trust decisions of its own: recipient selection,
+  consent, and rate limits belong to the caller (in wingston: roster). By
+  default (no `trusted_sources` configured) every sender gets the full
+  action surface — keep it topology-internal, not agent-callable. Set
+  `trusted_sources`/`open_actions` to safely open `draw` to agents without
+  exposing the mutating actions (see Config below).
+
+  `draw` also accepts an optional `"category"`: for `rotate: true` slots it
+  narrows the live pool to fragments tagged with that category before
+  seen-filtering (an empty/unknown category falls back to the full pool —
+  never errors); echoed back in the reply only when supplied.
 
   ## Config
     - `template` — ordered slot list `[%{kind: "opener", rotate: false}, ...]`
@@ -23,6 +31,14 @@ defmodule Genswarms.Tips do
     - `reshuffle_guard` — ids kept on exhaustion reshuffle (default 20).
     - `store` — optional module (atom or string, resolved without atom
       minting). Memory-only without one — the documented dev mode.
+    - `trusted_sources` — nil/absent (default) ⇒ EVERY sender is fully
+      trusted (byte-identical to every release through 0.1.2 — back-compat).
+      Set it (list of atoms/strings, compared as strings) ⇒ listed senders
+      keep the full action surface; any OTHER sender gets ONLY
+      `open_actions`; every other action replies
+      `{"ok":false,"error":"untrusted"}`. Mirrors cron's trusted-source idiom.
+    - `open_actions` — actions an untrusted sender may still call when
+      `trusted_sources` is set. Default `["draw"]`.
 
   ## Store seam (every callback optional; guarded by function_exported?)
       load_fragments() :: [fragment_map]           # full pool at boot
@@ -53,15 +69,24 @@ defmodule Genswarms.Tips do
        salt: Map.get(config, :salt, @default_salt),
        guard: normalize_guard(Map.get(config, :reshuffle_guard, @default_guard)),
        fragments: load_fragments(store),
-       seen: load_seen(store)
+       seen: load_seen(store),
+       # nil (absent) is the fail-OPEN sentinel — every sender fully trusted,
+       # byte-identical to every release through 0.1.2. Only a configured list
+       # switches the object into gated mode (contrast cron's fail-closed
+       # empty-list default: tips predates any trust model, so back-compat
+       # requires the opposite default here).
+       trusted_sources: normalize_trusted_sources(Map.get(config, :trusted_sources)),
+       open_actions: normalize_open_actions(Map.get(config, :open_actions))
      }}
   end
 
   def interface do
     %{
       draw: %{
-        input: ~s({"action":"draw","recipient_id":"tg:1:0","date":"2026-07-03"}),
-        output: ~s({"ok":true,"text":"...","fragment_ids":["a1b2..."],"recipient_id":"tg:1:0","date":"2026-07-03"})
+        input:
+          ~s({"action":"draw","recipient_id":"tg:1:0","date":"2026-07-03","category":"hooks"}),
+        output:
+          ~s({"ok":true,"text":"...","fragment_ids":["a1b2..."],"recipient_id":"tg:1:0","date":"2026-07-03","category":"hooks"})
       },
       commit: %{
         input: ~s({"action":"commit","recipient_id":"tg:1:0","fragment_ids":["a1b2..."]}),
@@ -81,19 +106,40 @@ defmodule Genswarms.Tips do
     }
   end
 
-  def handle_message(_from, content, state) do
+  # trusted_sources nil (absent, the default) skips the gate entirely — same
+  # code path as every release through 0.1.2, so back-compat is structural,
+  # not just behavioral. Only a configured trusted_sources routes through the
+  # allowed?/2 check, and only a decoded action string is gate-checked at
+  # all — a decode failure or shape the dispatch table doesn't recognize
+  # falls straight through to the existing bad_request reply either way.
+  def handle_message(from, content, state) do
     case Jason.decode(content) do
-      {:ok, %{"action" => "draw", "recipient_id" => r, "date" => d}}
-      when is_binary(r) and is_binary(d) ->
-        case Core.draw(state.fragments, state.seen, state.template, r, d, state.salt, state.guard) do
+      {:ok, %{"action" => action} = msg} when is_binary(action) ->
+        if allowed?(from, action, state),
+          do: dispatch(msg, state),
+          else: {:reply, Jason.encode!(%{ok: false, error: "untrusted"}), state}
+
+      _ ->
+        {:reply, Jason.encode!(%{ok: false, error: "bad_request"}), state}
+    end
+  end
+
+  defp dispatch(msg, state) do
+    case msg do
+      %{"action" => "draw", "recipient_id" => r, "date" => d} when is_binary(r) and is_binary(d) ->
+        category = if is_binary(msg["category"]), do: msg["category"]
+
+        case Core.draw(state.fragments, state.seen, state.template, r, d, state.salt, state.guard, category) do
           {:ok, %{text: text, rotating_ids: ids}} ->
-            {:reply, Jason.encode!(%{ok: true, text: text, fragment_ids: ids, recipient_id: r, date: d}), state}
+            reply = %{ok: true, text: text, fragment_ids: ids, recipient_id: r, date: d}
+            reply = if category, do: Map.put(reply, :category, category), else: reply
+            {:reply, Jason.encode!(reply), state}
 
           {:error, :empty_pool} ->
             {:reply, Jason.encode!(%{ok: false, error: "empty_pool", recipient_id: r}), state}
         end
 
-      {:ok, %{"action" => "commit", "recipient_id" => r, "fragment_ids" => ids}}
+      %{"action" => "commit", "recipient_id" => r, "fragment_ids" => ids}
       when is_binary(r) and is_list(ids) ->
         ids = Enum.filter(ids, &is_binary/1)
         seen_list = Map.get(state.seen, r, [])
@@ -106,16 +152,16 @@ defmodule Genswarms.Tips do
 
         {:reply, Jason.encode!(%{ok: true, reshuffled: reshuffled, recipient_id: r}), state}
 
-      {:ok, %{"action" => "add_fragments", "fragments" => frags}} when is_list(frags) ->
+      %{"action" => "add_fragments", "fragments" => frags} when is_list(frags) ->
         add_fragments(frags, state)
 
-      {:ok, %{"action" => "promote", "ids" => ids}} when is_list(ids) ->
+      %{"action" => "promote", "ids" => ids} when is_list(ids) ->
         set_status(ids, "live", state)
 
-      {:ok, %{"action" => "retire", "ids" => ids}} when is_list(ids) ->
+      %{"action" => "retire", "ids" => ids} when is_list(ids) ->
         set_status(ids, "retired", state)
 
-      {:ok, %{"action" => "stats"}} ->
+      %{"action" => "stats"} ->
         by_kind =
           Enum.reduce(state.fragments, %{}, fn f, acc ->
             Map.update(acc, "#{f.kind}/#{f.status}", 1, &(&1 + 1))
@@ -127,6 +173,15 @@ defmodule Genswarms.Tips do
       _ ->
         {:reply, Jason.encode!(%{ok: false, error: "bad_request"}), state}
     end
+  end
+
+  # nil trusted_sources = fail-open sentinel (back-compat default): every
+  # sender is trusted, gate never engages. Once configured, an untrusted
+  # sender still gets whatever's in open_actions (default draw only).
+  defp allowed?(_from, _action, %{trusted_sources: nil}), do: true
+
+  defp allowed?(from, action, %{trusted_sources: trusted, open_actions: open}) do
+    MapSet.member?(trusted, to_string(from)) or MapSet.member?(open, action)
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -197,6 +252,16 @@ defmodule Genswarms.Tips do
 
   defp normalize_guard(g) when is_integer(g) and g >= 0, do: g
   defp normalize_guard(_), do: @default_guard
+
+  # nil (absent, or anything else not a list) ⇒ the fail-OPEN sentinel —
+  # allowed?/3 short-circuits to true, matching 0.1.2 and earlier. Senders
+  # arrive as atoms or binaries (swarm topology vs. JSON IR); compare as
+  # strings, same idiom as cron's trusted_sources.
+  defp normalize_trusted_sources(list) when is_list(list), do: MapSet.new(list, &to_string/1)
+  defp normalize_trusted_sources(_), do: nil
+
+  defp normalize_open_actions(list) when is_list(list), do: MapSet.new(list, &to_string/1)
+  defp normalize_open_actions(_), do: MapSet.new(["draw"])
 
   @doc """
   Dashboard extension (probed data contract — the host's dashboard source calls
