@@ -1,5 +1,9 @@
 # genswarms-objects
 
+> Surfacing a package in the swarm dashboard? The full three-channel contract
+> (display wire, metrics allowlist, `dashboard_extension/1`) lives in
+> [INTEGRATING.md](INTEGRATING.md).
+
 Utility object handlers for [genswarms](https://github.com/genlayerlabs/genswarms)
 swarms — one lockstep monorepo, four swarmidx packages (`kind: handler`):
 

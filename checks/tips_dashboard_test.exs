@@ -22,6 +22,13 @@ defmodule Genswarms.TipsDashboardTest do
     assert Genswarms.Tips.dashboard_extension([]) == %{}
   end
 
+  test ":store_mod is the canonical opt name (INTEGRATING.md); :store stays as alias" do
+    canonical = Genswarms.Tips.dashboard_extension(store_mod: Genswarms.TipsDashboardStore)
+    legacy = Genswarms.Tips.dashboard_extension(store: Genswarms.TipsDashboardStore)
+    assert canonical == legacy
+    assert %{"dashboard_pages" => [_page]} = canonical
+  end
+
   test "with a store -> pool metrics page (fragments, recipients, seen, per-kind)" do
     %{"dashboard_pages" => [page]} =
       Genswarms.Tips.dashboard_extension(store: Genswarms.TipsDashboardStore)

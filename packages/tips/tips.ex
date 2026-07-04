@@ -267,11 +267,14 @@ defmodule Genswarms.Tips do
   Dashboard extension (probed data contract — the host's dashboard source calls
   this via `function_exported?`, never a compile dep). Reads the durable
   fragment/seen tables from the injected store:
-  `dashboard_extension(store: MyStore)`. Returns `%{"dashboard_pages" => [page]}`
-  in the generic page schema, or `%{}` without a store.
+  `dashboard_extension(store_mod: MyStore)` (`store:` accepted as a legacy
+  alias). Returns `%{"dashboard_pages" => [page]}` in the generic page schema,
+  or `%{}` without a store.
   """
   def dashboard_extension(opts \\ []) do
-    store = Keyword.get(opts, :store)
+    # :store_mod is the canonical opt name (matches cron/llm-proxy — see
+    # INTEGRATING.md); :store kept for hosts wired before the names unified
+    store = Keyword.get(opts, :store_mod) || Keyword.get(opts, :store)
 
     if is_nil(store) do
       %{}
