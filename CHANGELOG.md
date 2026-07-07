@@ -13,7 +13,7 @@ versions do not track them 1:1.
 
 ## cron (`packages/cron`, module `Genswarms.Cron`)
 
-### 0.2.3 — pending release (2026-07-07)
+### Unreleased (next publish: ≥0.2.6 — published lineage is already genlayerlabs/cron@0.2.5)
 
 Additive machine block for the dashboard-extension observability contract
 (observability v2 stages 2–4, task 1) — no change to `dashboard_pages` or
