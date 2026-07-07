@@ -85,6 +85,55 @@ end
 - This channel is optional: metrics and browser expose no extension at all and
   are fully integrated via channels 1–2.
 
+## Machine blocks + health_rules (observability contract)
+
+`dashboard_extension/1` can also return a **machine block**: a top-level key
+in the returned map, sibling to `"dashboard_pages"`, meant for machine
+consumers (an observer, wingston) rather than the human-facing page renderer.
+Convention, not a validated schema:
+
+- Versioned: `"v" => 1`.
+- Numeric where the page version is display-formatted: times are **ms
+  integers**, never display strings like `"cron 12:00"` or `"every 60s"` —
+  that formatting lives only in the page's `table` rows (see `job_row/1` vs
+  `machine_job/1` in `packages/cron/cron.ex`).
+
+A package may additionally ship `"health_rules"` **inside its own block**.
+The idea: whoever owns the failure mode declares how to detect it — the
+package knows what "stuck" or "over budget" means for its own data far
+better than a generic external watcher would — and ships that as pure
+declarative data alongside the numbers. Something else evaluates it.
+
+Cron's block (`packages/cron/cron.ex`, `dashboard_extension/1`, built from
+the `@health_rules` module attribute) looks like:
+
+```elixir
+%{
+  "cron" => %{
+    "v" => 1,
+    "jobs" => [%{"name" => "...", "next_run_at_ms" => 1780982400000,
+                 "last_run_at_ms" => 1780982340000, "state" => "active",
+                 "consec_failures" => 0}, ...],
+    "health_rules" => [
+      %{"id" => "missed_tick", "severity" => "warn", ...},
+      %{"id" => "job_failing", "severity" => "warn", ...}
+    ]
+  }
+}
+```
+
+The two shipped rule ids are `missed_tick` (an active job overdue past a
+30-minute grace baked into the rule) and `job_failing` (a job at or past 5
+consecutive failures) — see `@health_rules` in `packages/cron/cron.ex` for
+the exact predicate shape.
+
+**Caveat: this data is inert today.** There is no observer in this repo (or
+anywhere yet) that reads `health_rules` and evaluates it — no generic rule
+evaluator exists. Until a host wires one up, `health_rules` is just JSON
+sitting in the dashboard extension, same as any other unread field. Treat it
+like Channel 1/2/3: shipping it is free and safe, but it does nothing on its
+own.
+
 ## Testing your integration
 
 - Display emits: live telemetry-attach test, not a source grep. Helper:
