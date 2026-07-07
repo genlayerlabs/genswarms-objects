@@ -13,6 +13,25 @@ versions do not track them 1:1.
 
 ## cron (`packages/cron`, module `Genswarms.Cron`)
 
+### 0.2.3 — pending release (2026-07-07)
+
+Additive machine block for the dashboard-extension observability contract
+(observability v2 stages 2–4, task 1) — no change to `dashboard_pages` or
+any other existing key.
+
+- `dashboard_extension/1` now also returns `"cron" => %{"v" => 1, "jobs" =>
+  [...], "health_rules" => [...]}` alongside the existing `"dashboard_pages"`
+  page. Each job entry carries `name`, `next_run_at_ms`/`last_run_at_ms`
+  (Unix ms integer or `nil` — never the display-formatted strings the human
+  page uses), `state`, `consec_failures` — read from the same durable
+  `safe_load_jobs/1` list the page already renders.
+- Two rules ship as pure data (`@health_rules`): `missed_tick` (an active
+  job overdue past a 30-minute grace embedded in the rule) and
+  `job_failing` (5+ consecutive failures). Consumed by a separate
+  observer-side generic rule evaluator — operators tune grace/thresholds
+  via observer-side operator rules, not by editing this package.
+- `dashboard_extension()` without a store is still `%{}`.
+
 ### 0.2.2 — repo tag `v0.1.6` (2026-07-03, branch `feat/cron-0.2.2`)
 
 Absorbs the architecture review (`cron-arch-review.md`) and the audit's

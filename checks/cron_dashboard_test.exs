@@ -107,6 +107,95 @@ defmodule Genswarms.CronDashboardTest do
     assert %{"label" => "Jobs", "value" => 0} = Enum.find(items, &(&1["label"] == "Jobs"))
   end
 
+  test "without a store the machine block is absent too (still %{})" do
+    assert Genswarms.Cron.dashboard_extension([]) == %{}
+  end
+
+  test "with a store -> \"cron\" machine block (v1) alongside unchanged dashboard_pages" do
+    extension = Genswarms.Cron.dashboard_extension(store_mod: Genswarms.CronDashboardStore)
+
+    assert %{"dashboard_pages" => [page], "cron" => cron} = extension
+    assert cron["v"] == 1
+
+    assert [tips_job, outreach_job] = cron["jobs"]
+
+    assert tips_job == %{
+             "name" => "tips",
+             "next_run_at_ms" => 1_783_150_000_000,
+             "last_run_at_ms" => nil,
+             "state" => "active",
+             "consec_failures" => 0
+           }
+
+    assert outreach_job == %{
+             "name" => "outreach",
+             "next_run_at_ms" => nil,
+             "last_run_at_ms" => nil,
+             "state" => "paused",
+             "consec_failures" => 3
+           }
+
+    assert cron["health_rules"] == [
+             %{
+               "id" => "missed_tick",
+               "severity" => "warn",
+               "card" => "cron job {name} did not run (overdue past grace)",
+               "each" => "jobs",
+               "where" => %{
+                 "op" => "eq",
+                 "lhs" => %{"path" => "state"},
+                 "rhs" => %{"lit" => "active"}
+               },
+               "when" => %{
+                 "op" => "gt",
+                 "lhs" => "now",
+                 "rhs" => %{"add" => [%{"path" => "next_run_at_ms"}, 1_800_000]}
+               }
+             },
+             %{
+               "id" => "job_failing",
+               "severity" => "warn",
+               "card" => "cron job {name} failing repeatedly ({consec_failures} consecutive)",
+               "each" => "jobs",
+               "when" => %{"op" => "gte", "lhs" => %{"path" => "consec_failures"}, "rhs" => 5}
+             }
+           ]
+
+    # dashboard_pages stays byte-identical to the pre-existing shape.
+    assert page["id"] == "cron-jobs"
+    [metrics, table] = page["sections"]
+    assert metrics["type"] == "metrics"
+    assert table["type"] == "table"
+  end
+
+  test "a job with a non-integer next_run_at/last_run_at passes through as nil (int_or_nil)" do
+    defmodule WeirdTimesStore do
+      def load_cron_jobs(_states) do
+        [
+          %{
+            name: "weird",
+            state: "running",
+            next_run_at: "not-a-time",
+            last_run_at: 1_700_000_000_000,
+            consecutive_failures: 1
+          }
+        ]
+      end
+    end
+
+    %{"cron" => cron} = Genswarms.Cron.dashboard_extension(store_mod: WeirdTimesStore)
+
+    assert cron["jobs"] == [
+             %{
+               "name" => "weird",
+               "next_run_at_ms" => nil,
+               "last_run_at_ms" => 1_700_000_000_000,
+               "state" => "running",
+               "consec_failures" => 1
+             }
+           ]
+  end
+
   test "emit-site contract: job finish emits :job_run with status; breaker pause is its own beat" do
     assert @source =~ "kind: :job_run"
     [_, after_finish] = String.split(@source, "Scheduled job run finished", parts: 2)

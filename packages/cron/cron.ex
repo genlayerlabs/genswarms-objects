@@ -1114,14 +1114,47 @@ defmodule Genswarms.Cron do
     _ -> :ok
   end
 
+  # Shipped health rules for the "cron" machine block (v1). Pure data — the
+  # observer's generic rule evaluator (a separate, package-agnostic consumer)
+  # walks this shape, so treat it as a wire contract: a typo in an id/op/path
+  # here silently no-ops the rule instead of raising anywhere near this code.
+  #
+  # missed_tick: 30 minutes of grace is embedded in the shipped rule itself.
+  # Operators who want a different grace window tune it via an observer-side
+  # operator rule (`signal_rules` config), not by editing this package.
+  @health_rules [
+    %{
+      "id" => "missed_tick",
+      "severity" => "warn",
+      "card" => "cron job {name} did not run (overdue past grace)",
+      "each" => "jobs",
+      "where" => %{"op" => "eq", "lhs" => %{"path" => "state"}, "rhs" => %{"lit" => "active"}},
+      "when" => %{
+        "op" => "gt",
+        "lhs" => "now",
+        "rhs" => %{"add" => [%{"path" => "next_run_at_ms"}, 1_800_000]}
+      }
+    },
+    %{
+      "id" => "job_failing",
+      "severity" => "warn",
+      "card" => "cron job {name} failing repeatedly ({consec_failures} consecutive)",
+      "each" => "jobs",
+      "when" => %{"op" => "gte", "lhs" => %{"path" => "consec_failures"}, "rhs" => 5}
+    }
+  ]
+
   @doc """
   Dashboard extension (probed data contract — the host's dashboard source calls
   this via `function_exported?`, never a compile dep). Reads the DURABLE job
   rows from the injected store, so the page renders even when the scheduler
   object is mid-restart: `dashboard_extension(store_mod: MyStore)`.
 
-  Returns `%{"dashboard_pages" => [page]}` in the generic page schema
-  (sections of `"metrics"` items + a `"table"`), or `%{}` without a store.
+  Returns `%{"dashboard_pages" => [page], "cron" => machine_block}` — the
+  page in the generic page schema (sections of `"metrics"` items + a
+  `"table"`) for humans, and `"cron"` (v1: per-job ms fields + shipped
+  `health_rules`) for machine consumers (observer detectors, wingston) — or
+  `%{}` without a store.
   """
   def dashboard_extension(opts \\ []) do
     store_mod = Keyword.get(opts, :store_mod)
@@ -1167,7 +1200,12 @@ defmodule Genswarms.Cron do
               }
             ]
           }
-        ]
+        ],
+        "cron" => %{
+          "v" => 1,
+          "jobs" => Enum.map(jobs, &machine_job/1),
+          "health_rules" => @health_rules
+        }
       }
     end
   end
@@ -1201,6 +1239,21 @@ defmodule Genswarms.Cron do
       "failures" => job[:consecutive_failures] || 0
     }
   end
+
+  # Machine-block row for the "cron" extension key — ms integers (or nil),
+  # never the display-formatted strings job_row/1 produces.
+  defp machine_job(job) do
+    %{
+      "name" => to_string(job[:name] || "?"),
+      "next_run_at_ms" => int_or_nil(job[:next_run_at]),
+      "last_run_at_ms" => int_or_nil(job[:last_run_at]),
+      "state" => to_string(job[:state] || "?"),
+      "consec_failures" => job[:consecutive_failures] || 0
+    }
+  end
+
+  defp int_or_nil(v) when is_integer(v), do: v
+  defp int_or_nil(_), do: nil
 
   # canonical persisted shape first (Schedule.normalize/2 output), then the
   # pre-normalize input shapes (flat test stores hand those in)
