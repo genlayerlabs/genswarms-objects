@@ -171,6 +171,14 @@ Store write failure keeps the grant in-memory, loudly. Each applied grant
 emits a `:browser_grant` display event. `meta` is opaque provenance — this
 package still never learns what a campaign is.
 
+Review hardening (same release): the empty/unreadable allowlist file is an
+operator KILL SWITCH — stored and runtime grants are suppressed (persisted
+but inactive, noted in the reply) rather than unioned over an empty floor;
+store callbacks are applied directly so a wrong-arity/renamed store fails
+loudly through the rescue paths instead of silently persisting nothing; and
+grant application is batched (one policy union + one renderer-cage recompute
+per allow_sync, not per host).
+
 ### 0.1.1 — repo tags `v0.1.0`→`v0.1.1` (2026-07-02)
 
 Extracted from wingston-rally-bot: allowlist-capped web browser for agents

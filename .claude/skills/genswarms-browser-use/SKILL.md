@@ -55,7 +55,12 @@ config: %{
   not a policy. The render-time SSRF gate still applies to granted hosts.
 - Boot allowset = allowlist file ∪ stored grants; a raising store falls back
   to the file-only floor. A store WRITE failure keeps the grant in memory
-  (lost on restart, logged loudly).
+  (lost on restart, logged loudly). The store is called directly — a store
+  wired against a stale contract (wrong arity) fails loudly, never silently.
+- **Kill switch**: an EMPTY/unreadable allowlist file means nothing is
+  reachable — stored AND runtime grants are suppressed (persisted, noted in
+  the reply, but inactive) until the floor is restored and the object
+  restarts. Emptying the file during an incident actually stops browsing.
 - Denylist mode: grants are accepted + persisted (ready for a mode flip) but
   don't change reachability — the reply carries a `note`.
 - Any other sender gets `{"error":"unauthorized"}`. The action is deliberately

@@ -44,6 +44,12 @@ defmodule BrowserGrantsTest do
     def save_grant(_h, _m), do: :ok
   end
 
+  # Wrong arity — simulates a store wired against a stale/renamed contract.
+  defmodule BadArityStore do
+    def load_grants, do: []
+    def save_grant(_h, _m, _extra), do: :ok
+  end
+
   defmodule BoomSaveStore do
     def load_grants, do: []
     def save_grant(_h, _m), do: raise("write failed")
@@ -209,6 +215,62 @@ defmodule BrowserGrantsTest do
     st = init!(%{grants_store: BoomLoadStore})
     assert :ok = Core.gate("https://genlayer.com/", st.policy, st.resolver)
     assert {:error, {:not_allowed, _}} = Core.gate("https://anything.example/", st.policy, st.resolver)
+  end
+
+  test "an EMPTY file floor is a kill switch: stored grants do NOT reopen the gate" do
+    Process.put(:fake_grants, ["stored.example"])
+    empty = "/tmp/grants-empty-#{System.unique_integer([:positive])}.txt"
+    File.write!(empty, "# nothing\n")
+
+    st = init!(%{allowlist_path: empty, grants_store: FakeStore})
+
+    assert {:allow, set} = st.policy
+    assert MapSet.size(set) == 0
+    assert {:error, {:not_allowed, _}} = Core.gate("https://stored.example/", st.policy, st.resolver)
+    Process.delete(:fake_grants)
+  end
+
+  test "an UNREADABLE file floor is a kill switch too" do
+    Process.put(:fake_grants, ["stored.example"])
+
+    st =
+      init!(%{
+        allowlist_path: "/tmp/grants-missing-#{System.unique_integer([:positive])}.txt",
+        grants_store: FakeStore
+      })
+
+    assert {:allow, set} = st.policy
+    assert MapSet.size(set) == 0
+    Process.delete(:fake_grants)
+  end
+
+  test "with an empty floor, runtime grants persist but do NOT reopen the gate" do
+    Process.delete(:fake_grants)
+    empty = "/tmp/grants-empty-#{System.unique_integer([:positive])}.txt"
+    File.write!(empty, "")
+
+    st = init!(%{allowlist_path: empty, grants_store: FakeStore})
+    {:reply, reply, st2} = allow_sync(st, ["campaign.example"])
+
+    assert %{"ok" => true, "added" => 1} = Jason.decode!(reply)
+    # persisted for a healthy-floor restart…
+    assert Process.get(:fake_grants) == ["campaign.example"]
+    # …but the kill switch holds: nothing reachable now
+    assert {:error, {:not_allowed, _}} = Core.gate("https://campaign.example/", st2.policy, st2.resolver)
+    Process.delete(:fake_grants)
+  end
+
+  test "a wrong-arity store save fails LOUDLY, grant still applies in memory" do
+    st = init!(%{grants_store: BadArityStore})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        {:reply, reply, st2} = allow_sync(st, ["campaign.example"])
+        assert %{"ok" => true, "added" => 1} = Jason.decode!(reply)
+        assert :ok = Core.gate("https://campaign.example/", st2.policy, st2.resolver)
+      end)
+
+    assert log =~ "grant store write failed"
   end
 
   test "store write failure still applies the grant in memory" do
