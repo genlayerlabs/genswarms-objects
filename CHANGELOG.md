@@ -149,6 +149,28 @@ a consumer pin (wingston adopted at 0.2.1 or later).
 
 ## browse (`packages/browse`, module `Genswarms.Browse`)
 
+Renamed to `packages/browser` (module `Genswarms.Browser`, published as
+`genlayerlabs/browser`) with the denylist-mode work; new entries continue
+under this section with the new name.
+
+### browser 0.2.0 — 2026-07-09 (branch `feat/browser-allow-sync`)
+
+Runtime allowlist grants: a new object-to-object `allow_sync` action
+(deliberately absent from the agent-facing `interface/0`) lets senders
+listed in the new `grant_sources` config extend the allow set live —
+`{"action":"allow_sync","hosts":[...],"meta":{...}}` → hosts re-pass a
+package-side sanity floor (`Core.grantable_host?/1`: bare dotted DNS names
+only — no IP literals, `localhost`, `.local`/`.internal`), union into the
+allow policy + renderer cage, and persist through the new injectable
+`grants_store` seam (`load_grants/0`, `save_grant/2`; tips/cron store
+idiom). Boot allowset = file floor ∪ stored grants (store load re-applies
+the floor; a raising store falls back to file-only). `grant_sources`
+absent/empty = action disabled (full back-compat); denylist mode accepts +
+persists grants but leaves the deny policy untouched (noted in the reply).
+Store write failure keeps the grant in-memory, loudly. Each applied grant
+emits a `:browser_grant` display event. `meta` is opaque provenance — this
+package still never learns what a campaign is.
+
 ### 0.1.1 — repo tags `v0.1.0`→`v0.1.1` (2026-07-02)
 
 Extracted from wingston-rally-bot: allowlist-capped web browser for agents

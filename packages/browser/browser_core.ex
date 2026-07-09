@@ -119,6 +119,30 @@ defmodule Genswarms.Browser.Core do
     end
   end
 
+  # Bare dotted DNS name: letter/digit labels (hyphens inside), at least one dot.
+  # Excludes `:` `/` `@` and whitespace by construction.
+  @grant_host_re ~r/\A[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+\z/
+
+  @doc """
+  True iff `host` is a sane, grantable public hostname for the runtime
+  `allow_sync` surface: a bare dotted DNS name only — no IP literals (v4 passes
+  the shape regex, so `:inet.parse_address` re-checks), no `localhost`, no
+  `.local`/`.internal` suffixes, no port/path/userinfo/whitespace junk.
+  Callers curate WHAT gets granted; this floor is re-applied by the object on
+  every receipt because the action will outlive its first trusted consumer.
+  """
+  @spec grantable_host?(term()) :: boolean()
+  def grantable_host?(host) when is_binary(host) do
+    h = normalize_host(host)
+
+    Regex.match?(@grant_host_re, h) and
+      not match?({:ok, _}, :inet.parse_address(String.to_charlist(h))) and
+      h != "localhost" and
+      not String.ends_with?(h, [".local", ".internal"])
+  end
+
+  def grantable_host?(_), do: false
+
   @doc "Render the allowlist into agent-browser's --allowed-domains (with *. wildcards)."
   # Assumes `allowset` holds bare domains (e.g. "example.com"), not pre-wildcarded entries.
   @spec allowed_domains_arg(MapSet.t(String.t())) :: String.t()
