@@ -66,7 +66,20 @@ defmodule Genswarms.Browser do
     # list), so allowed_domains is nil and the gate/redirect logic runs off `policy` alone.
     mode = Map.get(config, :mode, :allowlist)
 
-    {policy, allowed_domains} =
+    # Runtime grants (allow_sync): senders listed in :grant_sources may extend the
+    # allow set live; absent/empty = the action is disabled (full back-compat).
+    # Grants load from the injectable :grants_store at boot and union with the file
+    # floor in allowlist mode; a store failure falls back to the file-only floor
+    # (fail closed toward the trust anchor). The sanity floor re-applies on load —
+    # a store row predating a floor tightening must not resurrect a bad host.
+    grant_sources = normalize_grant_sources(Map.get(config, :grant_sources))
+    grants_store = module_ref(Map.get(config, :grants_store))
+    grants = load_grants(grants_store)
+
+    if MapSet.size(grants) > 0,
+      do: Logger.info("browser: #{MapSet.size(grants)} granted host(s) loaded from store")
+
+    {policy, allowed_domains, floor_empty} =
       case mode do
         :denylist ->
           path =
@@ -76,11 +89,11 @@ defmodule Genswarms.Browser do
           case load_hostset(path) do
             {:ok, set} ->
               Logger.info("browser: denylist mode — #{MapSet.size(set)} blocked host(s) from #{path}")
-              {{:deny, set}, nil}
+              {{:deny, set}, nil, false}
 
             {:error, r} ->
               Logger.error("browser: denylist #{path} unreadable (#{inspect(r)}) — FAIL-CLOSED, blocking everything")
-              {{:allow, MapSet.new()}, nil}
+              {{:allow, MapSet.new()}, nil, true}
           end
 
         _ ->
@@ -88,17 +101,31 @@ defmodule Genswarms.Browser do
             Map.get(config, :allowlist_path) || System.get_env("WINGSTON_BROWSE_ALLOWLIST") ||
               Path.join(File.cwd!(), "config/browse-allowlist.txt")
 
-          set =
+          file_set =
             case load_hostset(path) do
               {:ok, s} -> s
               {:error, _} -> MapSet.new()
             end
 
-          if MapSet.size(set) == 0,
-            do: Logger.error("browser: allowlist #{path} empty/unreadable — fail-closed"),
-            else: Logger.info("browser: allowlist mode — #{MapSet.size(set)} host(s) from #{path}")
+          # The FILE is the operator's kill switch: an empty/unreadable floor means
+          # NOTHING is reachable — stored grants must not reopen the gate (emptying
+          # the file during an incident has to actually stop browsing). The same
+          # flag suppresses RUNTIME grants below (apply_grants).
+          if MapSet.size(file_set) == 0 do
+            Logger.error("browser: allowlist #{path} empty/unreadable — fail-closed")
 
-          {{:allow, set}, Browse.allowed_domains_arg(set)}
+            if MapSet.size(grants) > 0,
+              do:
+                Logger.error(
+                  "browser: #{MapSet.size(grants)} stored grant(s) SUPPRESSED — the file floor is the kill switch"
+                )
+
+            {{:allow, MapSet.new()}, Browse.allowed_domains_arg(MapSet.new()), true}
+          else
+            Logger.info("browser: allowlist mode — #{MapSet.size(file_set)} host(s) from #{path}")
+            set = MapSet.union(file_set, grants)
+            {{:allow, set}, Browse.allowed_domains_arg(set), false}
+          end
       end
 
     renderer = Map.get(config, :renderer, Genswarms.Browser.AgentBrowser)
@@ -111,6 +138,15 @@ defmodule Genswarms.Browser do
        # the --allowed-domains string is passed to the renderer per call (no global state);
        # nil in denylist mode (no positive allowlist to hand the renderer).
        allowed_domains: allowed_domains,
+       mode: mode,
+       # true when the allowlist file floor was empty/unreadable at boot — the
+       # operator kill switch; grants (stored or runtime) never reopen the gate.
+       floor_empty: floor_empty,
+       grant_sources: grant_sources,
+       grants_store: grants_store,
+       # granted hosts kept in BOTH modes (denylist persists them ready for a
+       # mode flip; they only shape `policy` in allowlist mode).
+       grants: grants,
        renderer: renderer,
        resolver: Map.get(config, :resolver, &Browse.resolve_host/1),
        redirect_fetcher: Map.get(config, :redirect_fetcher),
@@ -192,6 +228,11 @@ defmodule Genswarms.Browser do
       {:ok, %{"action" => "press", "key" => key} = m} when is_binary(key) ->
         do_act(from, :press, %{key: key}, "press #{key}", full?(m), state)
 
+      # Object-to-object surface, NOT agent-facing (deliberately absent from
+      # interface/0): a grant source extends the allow set at runtime.
+      {:ok, %{"action" => "allow_sync"} = m} ->
+        do_allow_sync(from, m, state)
+
       {:ok, %{"action" => other}} ->
         {:reply, err("unknown action: #{other}"), state}
 
@@ -249,6 +290,91 @@ defmodule Genswarms.Browser do
             {:reply, err("blocked"), state}
         end
     end
+  end
+
+  # ── allow_sync: runtime allowlist grants ──
+  # The sender must be in :grant_sources (unset/empty = disabled — unauthorized).
+  # Hosts pass the package-side sanity floor AGAIN (the caller curates, we verify),
+  # union into the allow policy (allowlist mode) and persist via :grants_store.
+  # `meta` is opaque provenance (this package never learns what a campaign is) —
+  # passed through to the store and the audit log only.
+  defp do_allow_sync(from, m, state) do
+    cond do
+      to_string(from) not in state.grant_sources ->
+        Logger.warning("browse: from=#{from} action=allow_sync verdict=unauthorized")
+        {:reply, err("unauthorized"), state}
+
+      not is_list(m["hosts"]) ->
+        {:reply, err("bad_hosts — expected a list of hostnames"), state}
+
+      true ->
+        meta = if is_map(m["meta"]), do: m["meta"], else: %{}
+
+        {valid, invalid} = Enum.split_with(m["hosts"], &Browse.grantable_host?/1)
+        fresh = valid |> Enum.map(&Browse.normalize_host/1) |> MapSet.new() |> MapSet.difference(state.grants)
+
+        state = apply_grants(fresh, meta, from, state)
+
+        payload = %{
+          ok: true,
+          added: MapSet.size(fresh),
+          skipped: length(invalid),
+          total: MapSet.size(state.grants)
+        }
+
+        payload =
+          cond do
+            state.mode == :denylist ->
+              Map.put(payload, :note, "denylist mode — grants persisted but inactive (no positive allowlist)")
+
+            state.floor_empty ->
+              Map.put(payload, :note, "kill switch engaged (empty file floor) — grants persisted but inactive")
+
+            true ->
+              payload
+          end
+
+        Logger.info(
+          "browse: from=#{from} action=allow_sync added=#{payload.added} skipped=#{payload.skipped} " <>
+            "total=#{payload.total} meta=#{inspect(meta)}"
+        )
+
+        {:reply, Jason.encode!(payload), state}
+    end
+  end
+
+  # Batch-apply fresh grants: ONE policy union + ONE renderer-cage recompute
+  # (never per-host), then persist + emit per host. Policy is only extended in
+  # allowlist mode with a healthy file floor — grants are recorded/persisted
+  # regardless (ready for a mode flip or a healthy-floor restart), which is also
+  # why `grants` is tracked separately from `policy`. Persistence is best-effort:
+  # a flaky store must not break a live flow — the grant stays in memory and is
+  # lost on restart, loudly.
+  defp apply_grants(fresh, meta, from, state) do
+    state =
+      case {state.mode, state.floor_empty, state.policy} do
+        {:allowlist, false, {:allow, set}} ->
+          set = MapSet.union(set, fresh)
+          %{state | policy: {:allow, set}, allowed_domains: Browse.allowed_domains_arg(set)}
+
+        _ ->
+          state
+      end
+
+    Enum.each(fresh, fn host ->
+      if state.grants_store do
+        try do
+          state.grants_store.save_grant(host, meta)
+        rescue
+          e ->
+            Logger.error("browser: grant store write failed for #{host} (#{Exception.message(e)}) — in-memory only")
+        end
+      end
+
+      display(:browser_grant, %{host: host, source: to_string(from)})
+    end)
+
+    %{state | grants: MapSet.union(state.grants, fresh)}
   end
 
   defp do_act(from, verb, arg, desc, full?, state) do
@@ -530,6 +656,42 @@ defmodule Genswarms.Browser do
     new = if now_ms(state) - t < 60_000, do: {count + 1, t}, else: {1, now_ms(state)}
     %{state | rate: Map.put(state.rate, from, new)}
   end
+
+  # ── grants config + store seams (tips/cron idiom) ──
+  # Sources compare as strings (config may hold atoms, engine senders arrive as
+  # either). Anything but a non-empty list disables the action.
+  defp normalize_grant_sources(l) when is_list(l), do: Enum.map(l, &to_string/1)
+  defp normalize_grant_sources(_), do: []
+
+  # Boot load: every stored host re-passes the sanity floor (a row written before
+  # a floor tightening must not resurrect). A raising store → file-only floor.
+  defp load_grants(nil), do: MapSet.new()
+
+  # Store calls are DIRECT applies — no function_exported? shield. A store wired
+  # against a stale contract (wrong arity, renamed callback) must fail LOUDLY
+  # through the rescue paths, not silently persist nothing forever.
+  defp load_grants(store) do
+    store.load_grants()
+    |> Enum.filter(&Browse.grantable_host?/1)
+    |> Enum.map(&Browse.normalize_host/1)
+    |> MapSet.new()
+  rescue
+    e ->
+      Logger.error("browser: grants store load failed (#{Exception.message(e)}) — file-only floor")
+      MapSet.new()
+  end
+
+  # Resolve a module from config without minting atoms (tips idiom).
+  defp module_ref(nil), do: nil
+  defp module_ref(mod) when is_atom(mod), do: mod
+
+  defp module_ref(name) when is_binary(name) do
+    String.to_existing_atom("Elixir." <> String.trim_leading(name, "Elixir."))
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp module_ref(_), do: nil
 
   # display-event one-liner (docs/display-event-feed-plan.md): a free no-op
   # unless the EventFeed collector is attached on the live host

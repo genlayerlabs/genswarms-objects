@@ -34,6 +34,42 @@ description: >-
 }}
 ```
 
+## Runtime grants (allow_sync — 0.2.0)
+
+Trusted objects may extend the allow set live, without a restart:
+
+```elixir
+config: %{
+  # …allowlist/denylist config as above, plus:
+  grant_sources: [:rally],        # ONLY these senders may allow_sync; absent/[] = disabled
+  grants_store: MyApp.Store       # optional: load_grants/0 + save_grant/2 (persistence)
+}
+```
+
+- A grant source sends `{"action":"allow_sync","hosts":["docs.example.com"],
+  "meta":{…}}` → reply `{"ok":true,"added":N,"skipped":K,"total":M}`. `meta`
+  is opaque provenance, passed to the store untouched.
+- Every host re-passes the package's sanity floor on receipt AND on boot load
+  (bare dotted DNS names only — IP literals, `localhost`, `.local`/`.internal`
+  are skipped and counted). Curate harder upstream: the floor is a backstop,
+  not a policy. The render-time SSRF gate still applies to granted hosts.
+- Boot allowset = allowlist file ∪ stored grants; a raising store falls back
+  to the file-only floor. A store WRITE failure keeps the grant in memory
+  (lost on restart, logged loudly). The store is called directly — a store
+  wired against a stale contract (wrong arity) fails loudly, never silently.
+- **Kill switch**: an EMPTY/unreadable allowlist file means nothing is
+  reachable — stored AND runtime grants are suppressed (persisted, noted in
+  the reply, but inactive) until the floor is restored and the object
+  restarts. Emptying the file during an incident actually stops browsing.
+- Denylist mode: grants are accepted + persisted (ready for a mode flip) but
+  don't change reachability — the reply carries a `note`.
+- Any other sender gets `{"error":"unauthorized"}`. The action is deliberately
+  absent from `interface/0` — agents are never told it exists; don't add agent
+  slots to `grant_sources`.
+- Each applied grant emits a `:browser_grant` display event.
+- Revocation: delete the store row and restart (the object holds the union in
+  memory).
+
 ## The containment model (don't weaken it)
 
 ### Allowlist mode (default — fail-closed)
