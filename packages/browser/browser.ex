@@ -58,6 +58,22 @@ defmodule Genswarms.Browser do
   # string, so any drift fails there.
   @nav_marker "--- Other links on this page"
 
+  # Default allowlist-mode hosts: the GenLayer-family sites (operator request
+  # 2026-07-10). www. variants included where the apex 308-redirects to www —
+  # the gate is exact-host and re-gates every redirect hop, so without them
+  # those defaults would be dead on arrival. Override with config
+  # `:default_hosts` (an explicit [] opts out entirely).
+  @default_hosts [
+    "genlayer.com",
+    "docs.genlayer.com",
+    "genlayerlabs.com",
+    "www.genlayerlabs.com",
+    "subzeroclaw.com",
+    "genswarms.com",
+    "unhardcoded.com",
+    "www.unhardcoded.com"
+  ]
+
   def init(config) do
     # No :code.priv_dir (objects are Code.require_file'd, there is no :wingston OTP app);
     # configs pass an explicit :allowlist_path/:blocklist_path (Task 6). Env override, then
@@ -78,6 +94,16 @@ defmodule Genswarms.Browser do
 
     if MapSet.size(grants) > 0,
       do: Logger.info("browser: #{MapSet.size(grants)} granted host(s) loaded from store")
+
+    # Baked-in default hosts (operator request 2026-07-10): the GenLayer-family
+    # sites every allowlist-mode consumer should reach out of the box. The gate
+    # is exact-host and re-gates every redirect hop, so the apex→www 308s
+    # (genlayerlabs.com, unhardcoded.com) need both spellings listed. Config
+    # `:default_hosts` overrides ([] opts out). They EXTEND a live file floor
+    # and are suppressed by the kill switch exactly like grants — an emptied
+    # allowlist file must still stop ALL browsing. Denylist mode ignores them
+    # (there is no positive list to extend).
+    default_hosts = normalize_default_hosts(Map.get(config, :default_hosts))
 
     {policy, allowed_domains, floor_empty} =
       case mode do
@@ -110,7 +136,8 @@ defmodule Genswarms.Browser do
           # The FILE is the operator's kill switch: an empty/unreadable floor means
           # NOTHING is reachable — stored grants must not reopen the gate (emptying
           # the file during an incident has to actually stop browsing). The same
-          # flag suppresses RUNTIME grants below (apply_grants).
+          # flag suppresses RUNTIME grants below (apply_grants) AND the baked-in
+          # default hosts: defaults only ever EXTEND a live floor.
           if MapSet.size(file_set) == 0 do
             Logger.error("browser: allowlist #{path} empty/unreadable — fail-closed")
 
@@ -120,10 +147,19 @@ defmodule Genswarms.Browser do
                   "browser: #{MapSet.size(grants)} stored grant(s) SUPPRESSED — the file floor is the kill switch"
                 )
 
+            if MapSet.size(default_hosts) > 0,
+              do:
+                Logger.error(
+                  "browser: #{MapSet.size(default_hosts)} default host(s) SUPPRESSED — the file floor is the kill switch"
+                )
+
             {{:allow, MapSet.new()}, Browse.allowed_domains_arg(MapSet.new()), true}
           else
-            Logger.info("browser: allowlist mode — #{MapSet.size(file_set)} host(s) from #{path}")
-            set = MapSet.union(file_set, grants)
+            Logger.info(
+              "browser: allowlist mode — #{MapSet.size(file_set)} host(s) from #{path} + #{MapSet.size(default_hosts)} default(s)"
+            )
+
+            set = file_set |> MapSet.union(default_hosts) |> MapSet.union(grants)
             {{:allow, set}, Browse.allowed_domains_arg(set), false}
           end
       end
@@ -662,6 +698,18 @@ defmodule Genswarms.Browser do
   # either). Anything but a non-empty list disables the action.
   defp normalize_grant_sources(l) when is_list(l), do: Enum.map(l, &to_string/1)
   defp normalize_grant_sources(_), do: []
+
+  # nil = unset ⇒ the package default; an explicit list (incl. []) wins verbatim.
+  defp normalize_default_hosts(nil), do: normalize_default_hosts(@default_hosts)
+
+  defp normalize_default_hosts(hosts) when is_list(hosts) do
+    hosts
+    |> Enum.map(fn h -> h |> to_string() |> String.trim() |> Browse.normalize_host() end)
+    |> Enum.reject(&(&1 == ""))
+    |> MapSet.new()
+  end
+
+  defp normalize_default_hosts(_), do: MapSet.new()
 
   # Boot load: every stored host re-passes the sanity floor (a row written before
   # a floor tightening must not resurrect). A raising store → file-only floor.
