@@ -153,6 +153,20 @@ Renamed to `packages/browser` (module `Genswarms.Browser`, published as
 `genlayerlabs/browser`) with the denylist-mode work; new entries continue
 under this section with the new name.
 
+### browser 0.2.1 — repo tag `v0.1.15` (2026-07-10)
+
+Baked-in default hosts for allowlist mode (operator request): the
+GenLayer-family sites — genlayer.com, docs.genlayer.com, genlayerlabs.com,
+subzeroclaw.com, genswarms.com, unhardcoded.com — plus the `www.` variants
+of the two apexes that 308-redirect to www (genlayerlabs.com,
+unhardcoded.com; the gate is exact-host and re-gates every redirect hop).
+Defaults UNION into a live file floor alongside grants; the kill switch
+(empty/unreadable allowlist file) suppresses them exactly like grants — an
+emptied file still stops ALL browsing. New config `default_hosts` overrides
+the baked list; an explicit `[]` opts out (file-only floor, the pre-0.2.1
+behavior). Denylist mode ignores them (no positive list to extend). New
+check `checks/browser_default_hosts_test.exs` (7 tests).
+
 ### browser 0.2.0 — repo tag `v0.1.14` (2026-07-09, PR #8; published as swarmidx log #72, digest 76bd17d0…)
 
 Runtime allowlist grants: a new object-to-object `allow_sync` action
