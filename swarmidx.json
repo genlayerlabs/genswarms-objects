@@ -16,7 +16,7 @@
       "name": "browser",
       "dir": "packages/browser",
       "kind": "handler",
-      "description": "Web browser object for agents: render/click/type/back with compact replies. Two modes — allowlist (fail-closed) or denylist (allow any public host except a blocklist); denylist requires a deployment-provided IP-filtering egress proxy for sub-resource SSRF containment.",
+      "description": "Web browser object for agents: render/click/type/back with compact replies. Two modes — allowlist (fail-closed) or denylist (allow any public host except a blocklist); denylist requires a deployment-provided IP-filtering egress proxy for sub-resource SSRF containment. 0.2.0: allow_sync runtime grants (source-gated, injectable grants store, empty-floor kill switch).",
       "docs": "README.md",
       "skill": ".claude/skills/genswarms-browser-use/SKILL.md",
       "module": "Genswarms.Browser"
