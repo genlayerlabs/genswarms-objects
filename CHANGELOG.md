@@ -153,7 +153,7 @@ Renamed to `packages/browser` (module `Genswarms.Browser`, published as
 `genlayerlabs/browser`) with the denylist-mode work; new entries continue
 under this section with the new name.
 
-### browser 0.2.0 — 2026-07-09 (branch `feat/browser-allow-sync`)
+### browser 0.2.0 — repo tag `v0.1.14` (2026-07-09, PR #8; published as swarmidx log #72, digest 76bd17d0…)
 
 Runtime allowlist grants: a new object-to-object `allow_sync` action
 (deliberately absent from the agent-facing `interface/0`) lets senders
