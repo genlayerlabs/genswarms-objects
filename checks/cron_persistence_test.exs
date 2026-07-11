@@ -161,6 +161,21 @@ check.(
     Map.fetch!(state.jobs, job_id).state == "paused"
 )
 
+CronPersistenceStore.mode(:error)
+
+{:reply, _reply, state} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job_id}), state)
+
+{:reply, _reply, state} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "delete", job_id: job_id}), state)
+
+check.(
+  "a terminal save failure emits once without retaining an unrecoverable ID",
+  not Map.has_key?(state.jobs, job_id) and
+    not MapSet.member?(state.persistence_failures, job_id) and
+    Enum.count(CronPersistenceEvents.all(), &(elem(&1, 1) == :job_persistence_failed)) == 5
+)
+
 case Agent.get(failures, &Enum.reverse/1) do
   [] ->
     IO.puts("\nCRON_PERSISTENCE: ALL PASS")

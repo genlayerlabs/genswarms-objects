@@ -906,16 +906,19 @@ defmodule Genswarms.Cron do
   end
 
   defp persistence_transition(state, job, {:error, _reason}) do
-    if MapSet.member?(state.persistence_failures, job.id) do
-      state
-    else
+    unless MapSet.member?(state.persistence_failures, job.id) do
       emit_event(state, :job_persistence_failed, "Scheduled job persistence failed",
         swarm: state.swarm_name,
         metadata: persistence_metadata(job)
       )
-
-      %{state | persistence_failures: MapSet.put(state.persistence_failures, job.id)}
     end
+
+    failures =
+      if Map.has_key?(state.jobs, job.id),
+        do: MapSet.put(state.persistence_failures, job.id),
+        else: MapSet.delete(state.persistence_failures, job.id)
+
+    %{state | persistence_failures: failures}
   end
 
   defp persistence_transition(state, job, _success) do
