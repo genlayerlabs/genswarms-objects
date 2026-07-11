@@ -74,6 +74,17 @@ defmodule Genswarms.Browser do
     "www.unhardcoded.com"
   ]
 
+  @doc """
+  The baked-in allowlist-mode default hosts ("tier 0"), normalized and
+  sorted — exactly the set `init/1` applies when config `:default_hosts`
+  is unset (0.2.2). Public so consumers can DISPLAY the tier (dashboard
+  gate pages) without hardcoding a copy. Display-only: the effective
+  policy lives in the object's state (file floor ∪ defaults ∪ grants),
+  and the kill switch suppresses defaults — a consumer rendering this
+  list should mark it as conditional on a live file floor.
+  """
+  def default_hosts, do: nil |> normalize_default_hosts() |> Enum.sort()
+
   def init(config) do
     # No :code.priv_dir (objects are Code.require_file'd, there is no :wingston OTP app);
     # configs pass an explicit :allowlist_path/:blocklist_path (Task 6). Env override, then

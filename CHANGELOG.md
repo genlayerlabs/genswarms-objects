@@ -153,6 +153,16 @@ Renamed to `packages/browser` (module `Genswarms.Browser`, published as
 `genlayerlabs/browser`) with the denylist-mode work; new entries continue
 under this section with the new name.
 
+### browser 0.2.2 — repo tag `v0.1.16` (2026-07-11)
+
+Public `default_hosts/0`: the baked-in tier-0 list (normalized, sorted),
+exactly what `init/1` applies when config `default_hosts` is unset —
+consumers can now DISPLAY the tier (dashboard gate pages) without
+hardcoding a copy. Display-only seam: the effective policy stays in the
+object's state (file floor ∪ defaults ∪ grants) and the kill switch still
+suppresses defaults, so renderers should mark the tier as conditional on
+a live file floor. No behavior change to `init/1` or the gate.
+
 ### browser 0.2.1 — repo tag `v0.1.15` (2026-07-10)
 
 Baked-in default hosts for allowlist mode (operator request): the
