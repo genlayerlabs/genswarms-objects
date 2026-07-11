@@ -38,6 +38,18 @@ defmodule BrowserDefaultHostsTest do
 
   defp allow_set(%{policy: {:allow, set}}), do: set
 
+  test "default_hosts/0 exposes the tier publicly: exactly what init applies when unset (0.2.2)" do
+    # Display seam for dashboard gate pages — no consumer should hardcode a
+    # copy of the baked list. Sorted + normalized, and in lockstep with the
+    # set init/1 actually unions into a live floor.
+    public = Browser.default_hosts()
+
+    assert public == Enum.sort(@defaults)
+
+    st = init!(%{allowlist_path: write!(["example.com"])})
+    assert MapSet.subset?(MapSet.new(public), allow_set(st))
+  end
+
   test "defaults union into a live file floor (every family site allowed)" do
     st = init!(%{allowlist_path: write!(["example.org"])})
     set = allow_set(st)
