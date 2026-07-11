@@ -58,6 +58,7 @@ defmodule Genswarms.Cron do
       breaker_threshold: Map.get(config, :breaker_threshold, 5),
       jobs: jobs,
       tasks: %{},
+      persistence_failures: MapSet.new(),
       next_id: max(max_store_id + 1, next_memory_id(jobs)),
       # Fail-closed defaults: with no configured allowlists NOBODY can create
       # jobs and NO target is deliverable — the host declares both (pure data).
@@ -888,9 +889,55 @@ defmodule Genswarms.Cron do
   end
 
   defp persist_job(state, job) do
-    store_call(state.store_mod, :save_cron_job, [job], :ok)
-    state
+    if store_callback?(state.store_mod, :save_cron_job, 1) do
+      result =
+        try do
+          apply(state.store_mod, :save_cron_job, [job])
+        rescue
+          error -> {:error, error}
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+
+      persistence_transition(state, job, result)
+    else
+      state
+    end
   end
+
+  defp persistence_transition(state, job, {:error, _reason}) do
+    if MapSet.member?(state.persistence_failures, job.id) do
+      state
+    else
+      emit_event(state, :job_persistence_failed, "Scheduled job persistence failed",
+        swarm: state.swarm_name,
+        metadata: persistence_metadata(job)
+      )
+
+      %{state | persistence_failures: MapSet.put(state.persistence_failures, job.id)}
+    end
+  end
+
+  defp persistence_transition(state, job, _success) do
+    if MapSet.member?(state.persistence_failures, job.id) do
+      emit_event(state, :job_persistence_recovered, "Scheduled job persistence recovered",
+        swarm: state.swarm_name,
+        metadata: persistence_metadata(job)
+      )
+
+      %{state | persistence_failures: MapSet.delete(state.persistence_failures, job.id)}
+    else
+      state
+    end
+  end
+
+  defp persistence_metadata(job),
+    do: %{
+      operation: :save_cron_job,
+      job_id: job.id,
+      name: safe_text(job.name, 120),
+      dedupe_key: safe_optional(job.dedupe_key, 200)
+    }
 
   defp arm_timer(%{auto_tick: false} = state, _now), do: state
 
@@ -1091,13 +1138,17 @@ defmodule Genswarms.Cron do
   # store_call/4: guarded durable-store call — a nil/partial store_mod degrades
   # to memory-only (jobs live in state; they just don't survive a restart).
   defp store_call(store_mod, fun, args, default) do
-    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
-         function_exported?(store_mod, fun, length(args)) do
+    if store_callback?(store_mod, fun, length(args)) do
       apply(store_mod, fun, args)
     else
       default
     end
   end
+
+  defp store_callback?(store_mod, fun, arity),
+    do:
+      is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+        function_exported?(store_mod, fun, arity)
 
   # emit_event/4: optional events_mod (exports object/4 — e.g. a LogStore
   # wrapper); absent -> Logger metadata line.

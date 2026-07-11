@@ -11,7 +11,7 @@ defmodule Genswarms.Cron.Store do
   the seam; it changes no runtime behavior and adds no coupling.
 
   See the "Store seam contract" section in SKILL.md / README.md for the
-  full narrative: the atom-vs-string key split, the no-raise requirement,
+  full narrative: the atom-vs-string key split, callback failure semantics,
   the JSON round-trip, and why `claimed_due` never survives a reload.
   """
 
@@ -63,8 +63,10 @@ defmodule Genswarms.Cron.Store do
   @doc """
   Persist (upsert) a job. `job` is the full atom-keyed job map described by
   `t:job/0`. Called after every state transition (create, claim, finish,
-  pause/resume/delete, seed upsert) — expect frequent calls. Return value is
-  ignored; MUST NOT raise.
+  pause/resume/delete, seed upsert) — expect frequent calls. Return
+  `{:error, reason}` to report a durability failure; all other return values
+  count as success for backward compatibility. Raises, throws, and exits are
+  contained and reported as failures.
   """
   @callback save_cron_job(job :: job()) :: any()
 
