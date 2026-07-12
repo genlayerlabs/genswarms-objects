@@ -70,4 +70,26 @@ defmodule GenswarmsMetricsExtraKeysTest do
 
     refute Map.has_key?(state.totals, "minted_by_agent")
   end
+
+  test "the enumerated LLM proxy compaction counters are admitted" do
+    {:ok, state} = Metrics.init(%{flush_ms: 0})
+
+    {:noreply, state} =
+      Metrics.handle_message(
+        :x,
+        Jason.encode!(%{"action" => "bump", "key" => "llm_proxy_compact"}),
+        state
+      )
+
+    {:noreply, state} =
+      Metrics.handle_message(
+        :x,
+        Jason.encode!(%{"action" => "bump", "key" => "llm_proxy_compact_block"}),
+        state
+      )
+
+    assert state.totals["llm_proxy_compact"] == 1
+    assert state.totals["llm_proxy_compact_block"] == 1
+    refute Map.has_key?(state.totals, "metrics_rejected")
+  end
 end

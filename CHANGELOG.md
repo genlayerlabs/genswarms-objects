@@ -214,6 +214,14 @@ even though the repo tag has (`v0.1.5` as of this writing).
 
 ## metrics (`packages/metrics`, module `Genswarms.Metrics`)
 
+### 0.1.2 - 2026-07-12
+
+Add the two fixed LLM-proxy compaction counters to the closed allowlist:
+`llm_proxy_compact` and `llm_proxy_compact_block`. They were already emitted
+by `genswarms-llm-proxy`; rejecting them made legitimate proxy telemetry look
+like an unknown-key event and inflated `metrics_rejected`. The set remains
+fully enumerated — no prefix family was opened.
+
 ### 0.1.1 — repo tags `v0.1.0`→`v0.1.1` (2026-07-02)
 
 Extracted from wingston-rally-bot: fire-and-forget operational counters,
