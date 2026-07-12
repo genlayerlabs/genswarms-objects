@@ -13,6 +13,25 @@ versions do not track them 1:1.
 
 ## cron (`packages/cron`, module `Genswarms.Cron`)
 
+### 0.2.7 — repo tag `v0.1.17` (2026-07-12, PR #12 `issue-11`)
+
+Durable-store save failures become observable without interrupting in-memory
+scheduling (issue #11; surfaced by micromarkets#468).
+
+- `save_cron_job/1` failures are contained and reported: an explicit
+  `{:error, reason}` (or bare `:error`), and any raise/throw/exit, keeps the
+  job live in memory while `events_mod` receives one debounced
+  `:job_persistence_failed` transition and a later
+  `:job_persistence_recovered` once saving succeeds again. Failure-event
+  metadata is bounded and safe: operation, job id, name (120), dedupe key
+  (200), and `error` — `inspect(reason)` truncated to 120 chars. Never the
+  payload or origin.
+- Missing Store/save callbacks remain silent memory-only mode.
+  `load_cron_jobs/1`, `max_cron_job_id/0`, and `save_cron_run/2` are still
+  not rescued (see the Store seam contract in SKILL.md).
+- New standalone check `checks/cron_persistence_test.exs`; repo CI now runs
+  the whole checks suite on every push/PR (PR #14).
+
 ### 0.2.6 - 2026-07-07
 
 Additive machine block for the dashboard-extension observability contract
