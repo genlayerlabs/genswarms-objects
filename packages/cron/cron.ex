@@ -905,11 +905,17 @@ defmodule Genswarms.Cron do
     end
   end
 
-  defp persistence_transition(state, job, {:error, _reason}) do
+  # A bare :error is a common enough store convention that leaving it invisible
+  # is a trap — normalize it into the reported shape.
+  defp persistence_transition(state, job, :error),
+    do: persistence_transition(state, job, {:error, :error})
+
+  defp persistence_transition(state, job, {:error, reason}) do
     unless MapSet.member?(state.persistence_failures, job.id) do
       emit_event(state, :job_persistence_failed, "Scheduled job persistence failed",
         swarm: state.swarm_name,
-        metadata: persistence_metadata(job)
+        metadata:
+          Map.put(persistence_metadata(job), :error, safe_text(inspect(reason), 120))
       )
     end
 

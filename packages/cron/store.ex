@@ -64,9 +64,9 @@ defmodule Genswarms.Cron.Store do
   Persist (upsert) a job. `job` is the full atom-keyed job map described by
   `t:job/0`. Called after every state transition (create, claim, finish,
   pause/resume/delete, seed upsert) — expect frequent calls. Return
-  `{:error, reason}` to report a durability failure; all other return values
-  count as success for backward compatibility. Raises, throws, and exits are
-  contained and reported as failures.
+  `{:error, reason}` (or bare `:error`) to report a durability failure; all
+  other return values count as success for backward compatibility. Raises,
+  throws, and exits are contained and reported as failures.
   """
   @callback save_cron_job(job :: job()) :: any()
 

@@ -10,6 +10,7 @@ defmodule CronPersistenceStore do
     case Agent.get(__MODULE__, & &1) do
       :ok -> :ok
       :error -> {:error, :db_down}
+      :bare_error -> :error
       :raise -> raise "db down"
       :throw -> throw(:db_down)
       :exit -> exit(:db_down)
@@ -105,7 +106,8 @@ check.(
       operation: :save_cron_job,
       job_id: job_id,
       name: "durable job",
-      dedupe_key: "persistence:test"
+      dedupe_key: "persistence:test",
+      error: ":db_down"
     }
 )
 
@@ -136,7 +138,7 @@ check.(
 )
 
 state =
-  Enum.reduce([:raise, :throw, :exit], state, fn failure_mode, state ->
+  Enum.reduce([:raise, :throw, :exit, :bare_error], state, fn failure_mode, state ->
     CronPersistenceStore.mode(failure_mode)
 
     {:reply, reply, state} =
@@ -155,9 +157,9 @@ state =
 event_types = Enum.map(CronPersistenceEvents.all(), &elem(&1, 1))
 
 check.(
-  "raise/throw/exit failures recover and re-arm future failure detection",
-  Enum.count(event_types, &(&1 == :job_persistence_failed)) == 4 and
-    Enum.count(event_types, &(&1 == :job_persistence_recovered)) == 4 and
+  "raise/throw/exit/bare-:error failures recover and re-arm future failure detection",
+  Enum.count(event_types, &(&1 == :job_persistence_failed)) == 5 and
+    Enum.count(event_types, &(&1 == :job_persistence_recovered)) == 5 and
     Map.fetch!(state.jobs, job_id).state == "paused"
 )
 
@@ -173,7 +175,7 @@ check.(
   "a terminal save failure emits once without retaining an unrecoverable ID",
   not Map.has_key?(state.jobs, job_id) and
     not MapSet.member?(state.persistence_failures, job_id) and
-    Enum.count(CronPersistenceEvents.all(), &(elem(&1, 1) == :job_persistence_failed)) == 5
+    Enum.count(CronPersistenceEvents.all(), &(elem(&1, 1) == :job_persistence_failed)) == 6
 )
 
 case Agent.get(failures, &Enum.reverse/1) do

@@ -254,9 +254,11 @@ The load-bearing parts that are easy to get wrong:
 - **`max_cron_job_id()`** — an integer or numeric string ≥ 0; anything else
   is treated as absent and defaults to `0`.
 - **`save_cron_job(job)` failures are contained and observable.** Return
-  `{:error, reason}` to report a durability failure; every other return value
-  counts as success for backward compatibility. A raise, throw, or exit also
-  counts as failure. The job stays live in memory, while `events_mod` receives
+  `{:error, reason}` (or bare `:error`) to report a durability failure; every
+  other return value counts as success for backward compatibility. A raise,
+  throw, or exit also counts as failure. The failure event's metadata carries a
+  bounded `error` field (`inspect(reason)`, 120 chars) alongside the job id,
+  name, and dedupe key. The job stays live in memory, while `events_mod` receives
   one `:job_persistence_failed` transition and a later
   `:job_persistence_recovered` after saving succeeds again. Missing Store/save
   callbacks remain silent memory-only mode.
