@@ -26,6 +26,8 @@ defmodule Genswarms.Metrics do
                            tool-call spiral signature; SHOULD fall when a reliable tool-caller is pinned)
     - `llm_error_api`    — a provider `API error:` / exhaustion / 5xx (capacity failure,
                            orthogonal to model choice; should NOT move with a model swap)
+    - `llm_proxy_compact` — the LLM proxy compacted an oversized request before sending it
+    - `llm_proxy_compact_block` — compaction still could not make a request admissible
     - `orchestrator_boot`— the orchestrator BEAM started (bumped once per boot in run_live.exs);
                            a spike = a launchd relaunch storm (the load-test two-poller incident)
     - `spawn_shed`       — ingress shed a NEW-conversation spawn because the global spawn
@@ -84,6 +86,7 @@ defmodule Genswarms.Metrics do
     llm_proxy_requests llm_proxy_stream llm_proxy_budget_degraded llm_proxy_budget_block
     llm_proxy_budget_block_notified llm_proxy_request_quota_block llm_proxy_global_block llm_proxy_cost_invalid
     llm_proxy_upstream_error llm_proxy_upstream_retry llm_proxy_internal_error
+    llm_proxy_compact llm_proxy_compact_block
     llm_proxy_stream_status_mismatch llm_proxy_stream_unmetered llm_proxy_stream_disconnected
     llm_proxy_stream_truncated
   )
