@@ -40,7 +40,7 @@ the duplication these repos carried before the registry existed.
 - **cron**: `load_cron_jobs(states)`, `max_cron_job_id()`, `save_cron_job(job)`,
   `save_cron_run(job, result)` — see the "Store seam contract" section in
   `.claude/skills/genswarms-cron-use/SKILL.md` for the load-bearing arg/return
-  shapes (atom-keyed rows, the JSON round-trip, the never-raise requirement);
+  shapes (atom-keyed rows, the JSON round-trip, callback failure semantics);
   `Genswarms.Cron.Store` (packages/cron/store.ex) mirrors it as an optional
   `@behaviour` for compiler drift-checking.
 - **metrics**: `add_metrics(pending_map)`, `today_metrics()`.

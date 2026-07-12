@@ -253,11 +253,20 @@ The load-bearing parts that are easy to get wrong:
   `job |> Jason.encode!() |> Jason.decode!()`, not the raw atom-keyed job.
 - **`max_cron_job_id()`** — an integer or numeric string ≥ 0; anything else
   is treated as absent and defaults to `0`.
-- **Never raise.** None of these four calls are wrapped in a `try/rescue` on
-  the cron side — a raising store reaches the caller uncaught. From `init/1`
-  that means an `ObjectServer` boot crash (see "Boot behavior" below); from
-  a message handler it crashes that message's handling. Wrap store I/O in
-  your own guard.
+- **`save_cron_job(job)` failures are contained and observable.** Return
+  `{:error, reason}` (or bare `:error`) to report a durability failure; every
+  other return value counts as success for backward compatibility. A raise,
+  throw, or exit also counts as failure. The failure event's metadata carries a
+  bounded `error` field (`inspect(reason)`, 120 chars) alongside the job id,
+  name, and dedupe key. The job stays live in memory, while `events_mod` receives
+  one `:job_persistence_failed` transition and a later
+  `:job_persistence_recovered` after saving succeeds again. Missing Store/save
+  callbacks remain silent memory-only mode.
+- **The other callbacks must not raise.** `load_cron_jobs/1`,
+  `max_cron_job_id/0`, and `save_cron_run/2` are not rescued. From `init/1`, a
+  raising load/max callback causes an `ObjectServer` boot crash (see "Boot
+  behavior" below); a raising run-audit callback crashes message handling.
+  Wrap that Store I/O in your own guard.
 - **`claimed_due` is deliberately discarded on reload.** Whatever was
   persisted for `claimed_due` is dropped and reset to `nil` when a row is
   loaded — the in-flight claim marker is meaningless across a restart;
