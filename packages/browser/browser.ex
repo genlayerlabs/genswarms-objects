@@ -532,6 +532,7 @@ defmodule Genswarms.Browser do
 
   # Defensive: any unexpected renderer shape still tells the agent the action failed.
   defp deliver(from, desc, other, _full?, state) do
+    display(:browser_done, %{agent: from, verdict: "render_failed"})
     Logger.warning("browse: from=#{from} act=#{desc} verdict=render_failed reason=unexpected:#{inspect(other)}")
     {:reply, err("render_failed"), state}
   end
