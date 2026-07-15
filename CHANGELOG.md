@@ -172,6 +172,12 @@ Renamed to `packages/browser` (module `Genswarms.Browser`, published as
 `genlayerlabs/browser`) with the denylist-mode work; new entries continue
 under this section with the new name.
 
+### browser 0.2.3 — repo tag `v0.1.19` (2026-07-15)
+
+Unexpected renderer return shapes now emit the same `browser_done` /
+`render_failed` display event as ordinary renderer errors, so dashboard wait
+state and failure reporting cannot silently diverge from the error reply.
+
 ### browser 0.2.2 — repo tag `v0.1.16` (2026-07-11)
 
 Public `default_hosts/0`: the baked-in tier-0 list (normalized, sorted),

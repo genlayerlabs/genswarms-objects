@@ -12,6 +12,7 @@
 #
 #   mix run tests/browse_compact_test.exs
 ExUnit.start()
+Code.require_file("support/display_wire_helper.exs", __DIR__)
 # A page whose MAIN body is long enough to be truncated by a small head_chars, with a
 # unique token PAST the head, plus the renderer's nav-link index appended at the tail
 # (the "--- Other links on this page ---" section browse must preserve for navigation).
@@ -40,6 +41,16 @@ defmodule MockShort do
   def navigate(_u, _s, _a), do: {:ok, %{landed_url: "https://allowed.example.com/landed", text: @text}}
   @impl true
   def act(_v, _a, _s), do: {:ok, %{landed_url: "https://allowed.example.com/landed", text: @text}}
+  @impl true
+  def close(_s), do: :ok
+end
+
+defmodule MockUnexpected do
+  @behaviour Genswarms.Browser.Renderer
+  @impl true
+  def navigate(_u, _s, _a), do: :unexpected
+  @impl true
+  def act(_v, _a, _s), do: :unexpected
   @impl true
   def close(_s), do: :ok
 end
@@ -128,6 +139,16 @@ defmodule GenswarmsBrowserCompactTest do
     refute Map.has_key?(m, "links")
     refute Map.has_key?(m, "more")
     refute Map.has_key?(m, "text")
+  end
+
+  test "an unexpected renderer result emits the same render_failed completion as an error" do
+    DisplayWireHelper.attach!([:genswarms, :display])
+    m = render(state_for(MockUnexpected, 100))
+
+    assert m == %{"error" => "render_failed"}
+
+    assert_receive {:display_event,
+                    %{kind: :browser_done, agent: :agentA, verdict: "render_failed"}}
   end
 
   test "the full flag works on an interactive action too (click full:true)" do
