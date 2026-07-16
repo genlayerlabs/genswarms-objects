@@ -172,6 +172,18 @@ Renamed to `packages/browser` (module `Genswarms.Browser`, published as
 `genlayerlabs/browser`) with the denylist-mode work; new entries continue
 under this section with the new name.
 
+### browser 0.2.4 — repo tag `v0.1.20` (2026-07-16, PR #17)
+
+Render circuit breaker: a hung renderer cost a full `render_timeout_ms`
+(default 45s) on every attempt with no memory of prior timeouts. After
+`render_breaker_threshold` (default 3) consecutive render timeouts the breaker
+opens for `render_breaker_cooldown_ms` (default 60s) and a render fails fast
+with verdict `render_unavailable` instead of dispatching and waiting; a single
+success closes it, and after the cooldown one real attempt re-opens on a fresh
+timeout. Only `:render_timeout` trips it. Pure decision in `Browser.Core`
+(`breaker_open?/2`, `register_render/5`); config knobs default to sane values,
+so existing consumers get the guard for free.
+
 ### browser 0.2.3 — repo tag `v0.1.19` (2026-07-15)
 
 Unexpected renderer return shapes now emit the same `browser_done` /
