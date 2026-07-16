@@ -221,6 +221,13 @@ defmodule Genswarms.Browser do
        rate: %{},
        rate_max: Map.get(config, :rate_max, 10),
        render_timeout_ms: Map.get(config, :render_timeout_ms, 45_000),
+       # Render circuit breaker: after this many consecutive render timeouts,
+       # fail fast for `render_breaker_cooldown_ms` instead of stalling each
+       # agent another render_timeout_ms. A single success closes it.
+       render_breaker_threshold: Map.get(config, :render_breaker_threshold, 3),
+       render_breaker_cooldown_ms: Map.get(config, :render_breaker_cooldown_ms, 60_000),
+       render_fail_streak: 0,
+       breaker_open_until: nil,
        now_fn: Map.get(config, :now_fn, fn -> System.monotonic_time(:millisecond) end)
      }}
   end
@@ -296,6 +303,13 @@ defmodule Genswarms.Browser do
         Logger.info("browse: from=#{from} url=#{url} verdict=rate_limited")
         {:reply, err("rate_limited"), state}
 
+      Browse.breaker_open?(state.breaker_open_until, state.now_fn.()) ->
+        # Renderer is wedged (N consecutive timeouts) — don't make the agent eat
+        # another render_timeout_ms; answer immediately so it can move on.
+        display(:browser_done, %{agent: from, verdict: "render_unavailable"})
+        Logger.info("browse: from=#{from} url=#{url} verdict=render_unavailable (breaker open)")
+        {:reply, err("render_unavailable"), bump_rate(state, from)}
+
       true ->
         # Meter the request BEFORE the network-touching gate (DNS for allowlisted hosts)
         # + redirect resolution (curl HEAD). Previously bump_rate ran only on the success
@@ -315,7 +329,9 @@ defmodule Genswarms.Browser do
           ad = state.allowed_domains
           display(:browser_dispatch, %{agent: from, url: url})
           Logger.info("browse: from=#{from} url=#{url} resolved=#{final} verdict=dispatched session=#{sess}")
-          deliver(from, "render #{url}", render_sync(fn -> r.navigate(final, sess, ad) end, state), full?, state)
+          result = render_sync(fn -> r.navigate(final, sess, ad) end, state)
+          state = note_render(result, state)
+          deliver(from, "render #{url}", result, full?, state)
         else
           {:error, {:not_allowed, _}} ->
             display(:browser_done, %{agent: from, verdict: "not_allowed"})
@@ -337,6 +353,28 @@ defmodule Genswarms.Browser do
             {:reply, err("blocked"), state}
         end
     end
+  end
+
+  # Fold a render_sync result into the circuit-breaker streak. Only a
+  # `:render_timeout` (the 45s stall) trips it; a fast crash/error doesn't.
+  defp note_render(result, state) do
+    outcome =
+      case result do
+        {:ok, _} -> :ok
+        {:error, :render_timeout} -> :timeout
+        _ -> :other
+      end
+
+    {streak, open_until} =
+      Browse.register_render(
+        outcome,
+        state.render_fail_streak,
+        state.render_breaker_threshold,
+        state.render_breaker_cooldown_ms,
+        state.now_fn.()
+      )
+
+    %{state | render_fail_streak: streak, breaker_open_until: open_until}
   end
 
   # ── allow_sync: runtime allowlist grants ──

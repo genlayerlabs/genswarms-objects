@@ -304,6 +304,33 @@ defmodule Genswarms.Browser.Core do
         {:error, {:bad_curl_output, String.slice(out, 0, 120)}}
     end
   end
+
+  # ── render circuit breaker (pure decision) ──────────────────────────────────
+  # A hung renderer costs a full `render_timeout_ms` (default 45s) per attempt,
+  # and nothing remembered the previous timeout — so a persistently-broken
+  # renderer stalled every agent 45s at a time. After `threshold` consecutive
+  # timeouts the breaker opens for `cooldown_ms`; while open, a render fails
+  # fast instead of waiting. A single success closes it.
+
+  @doc "Is the breaker open? `open_until` is a monotonic-ms deadline or nil."
+  def breaker_open?(nil, _now), do: false
+  def breaker_open?(open_until, now) when is_integer(open_until), do: now < open_until
+
+  @doc """
+  Fold one render outcome into `{streak, open_until}`.
+  `:ok` closes (streak 0, nil). `:timeout` bumps the streak and, at/over
+  `threshold`, arms the cooldown. Any other outcome (a fast crash / http error
+  — not the 45s stall this guards) leaves the breaker untouched.
+  """
+  def register_render(:ok, _streak, _threshold, _cooldown_ms, _now), do: {0, nil}
+
+  def register_render(:timeout, streak, threshold, cooldown_ms, now) do
+    streak = streak + 1
+    open_until = if streak >= threshold, do: now + cooldown_ms, else: nil
+    {streak, open_until}
+  end
+
+  def register_render(_other, streak, _threshold, _cooldown_ms, _now), do: {streak, nil}
 end
 
 defmodule Genswarms.Browser.Renderer do
