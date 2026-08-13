@@ -60,6 +60,16 @@ coerced. Inbound messages over `max_message_bytes` (default 65536) are
 rejected `{ok:false, error:"message_too_large"}` for a trusted sender and
 silently dropped for an untrusted one.
 
+Trusted callers may attach a string `request_id` of at most 200 bytes. Every
+JSON reply echoes it unchanged, which lets asynchronous object callers
+correlate the response. It has no effect on authorization, job identity, or
+dedupe.
+
+Successful create, update, pause, resume, and delete replies include
+`persistence`: `persisted`, `degraded`, or `memory_only`. A degraded delete is
+safe to retry by the same job id; the scheduler retains a non-runnable
+tombstone until that terminal write succeeds.
+
 ## Create envelope
 
 `run_at` (top-level, one-shot convenience) and `schedule` (nested map, all
@@ -199,7 +209,8 @@ Every delivered message gains a reserved `cron` map:
 {"cron":{"job_id":7,"fire_id":"7:1751450400000","scheduled_at":1751450400000,"fired_at":1751450400213,"attempt":1,"instance":"cron"}}
 ```
 
-`fire_id` is stable across retries of one scheduled occurrence, so a target can
+`fire_id` is stable across retries and coalesced scheduler-crash recovery of one
+scheduled occurrence, so a target can
 deduplicate domain work. `attempt` increments per delivery attempt. Creation
 rejects a message that already contains `cron`; callers cannot forge scheduler
 identity.

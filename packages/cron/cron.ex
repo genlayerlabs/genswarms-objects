@@ -122,9 +122,25 @@ defmodule Genswarms.Cron do
         do: {:reply, Jason.encode!(%{ok: false, error: "message_too_large"}), state},
         else: {:noreply, state}
     else
-      handle_decoded_message(from, Jason.decode(content), state)
+      decoded = Jason.decode(content)
+
+      from
+      |> handle_decoded_message(decoded, state)
+      |> echo_request_id(decoded)
     end
   end
+
+  # Trusted object callers often use the ordinary asynchronous object route.
+  # Echoing their opaque request id lets them correlate the routed reply without
+  # granting any scheduling authority to that id. Invalid/oversized ids are
+  # ignored and never change the underlying action result.
+  defp echo_request_id({:reply, response, state}, {:ok, %{"request_id" => request_id}})
+       when is_binary(request_id) and byte_size(request_id) in 1..200 do
+    stamped = response |> Jason.decode!() |> Map.put("request_id", request_id) |> Jason.encode!()
+    {:reply, stamped, state}
+  end
+
+  defp echo_request_id(result, _decoded), do: result
 
   defp handle_decoded_message(from, decoded, state) do
     case decoded do
@@ -829,15 +845,24 @@ defmodule Genswarms.Cron do
           job ->
             job = %{job | state: new_state, updated_at: state.now_fn.()}
 
-            jobs =
-              if new_state in @terminal_states,
-                do: Map.delete(state.jobs, id),
-                else: Map.put(state.jobs, id, job)
+            state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
+            persistence = persistence_status(state, id)
 
-            state = persist_job(%{state | jobs: jobs}, job)
+            # Keep a failed terminal tombstone addressable in memory so the
+            # caller can retry the same delete. Once the write succeeds (or no
+            # durable callback exists), remove it from the runnable projection.
+            state =
+              if new_state in @terminal_states and persistence != "degraded",
+                do: %{state | jobs: Map.delete(state.jobs, id)},
+                else: state
 
-            {:reply, Jason.encode!(%{ok: true, job_id: id, state: new_state}),
-             arm_timer(state, state.now_fn.())}
+            {:reply,
+             Jason.encode!(%{
+               ok: true,
+               job_id: id,
+               state: new_state,
+               persistence: persistence
+             }), arm_timer(state, state.now_fn.())}
         end
 
       {:error, reason} ->
@@ -853,7 +878,8 @@ defmodule Genswarms.Cron do
                  "misfire",
                  "max_attempts",
                  "retry_backoff_ms",
-                 "breaker_threshold"
+                 "breaker_threshold",
+                 "request_id"
                ])
 
   defp update_job(raw_id, msg, state) do
@@ -888,7 +914,7 @@ defmodule Genswarms.Cron do
 
   defp validate_update_fields(msg) do
     extra = msg |> Map.keys() |> Enum.reject(&MapSet.member?(@update_keys, &1))
-    changed = msg |> Map.drop(["action", "job_id"]) |> map_size()
+    changed = msg |> Map.drop(["action", "job_id", "request_id"]) |> map_size()
 
     cond do
       extra != [] ->
@@ -985,7 +1011,13 @@ defmodule Genswarms.Cron do
     if job.next_run_at do
       state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
 
-      {:reply, Jason.encode!(%{ok: true, job_id: id, state: "active"}), arm_timer(state, now)}
+      {:reply,
+       Jason.encode!(%{
+         ok: true,
+         job_id: id,
+         state: "active",
+         persistence: persistence_status(state, id)
+       }), arm_timer(state, now)}
     else
       {:reply, Jason.encode!(%{ok: false, error: "job has no future run_at"}), state}
     end
@@ -1190,7 +1222,7 @@ defmodule Genswarms.Cron do
       max_attempts: to_id(data["max_attempts"]) || 3,
       retry_backoff_ms: to_id(data["retry_backoff_ms"]) || 60_000,
       breaker_threshold: to_id(data["breaker_threshold"]) || 5,
-      claimed_due: nil,
+      claimed_due: to_id(data["claimed_due"]),
       origin: data["origin"] || %{},
       payload: data["payload"] || %{},
       dedupe_key: data["dedupe_key"],

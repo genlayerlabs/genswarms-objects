@@ -332,6 +332,58 @@ check.(
     length(Agent.get(sink6, & &1)) == 1
 )
 
+# A running row means the scheduler may already have handed the occurrence to
+# its target before crashing. Coalesced recovery must replay with the persisted
+# original due point, not mint a restart-time occurrence id.
+crash_due = base_now - 60_000
+
+running_row = %{
+  id: 100,
+  state: "running",
+  data: %{
+    "id" => 100,
+    "name" => "crash replay",
+    "schedule" => %{"kind" => "every_ms", "every_ms" => 300_000},
+    "next_run_at" => nil,
+    "last_run_at" => crash_due,
+    "last_status" => nil,
+    "last_error" => nil,
+    "state" => "running",
+    "misfire" => "coalesce",
+    "consecutive_failures" => 0,
+    "paused_by" => nil,
+    "claimed_due" => crash_due,
+    "attempts" => 1,
+    "max_attempts" => 3,
+    "retry_backoff_ms" => 60_000,
+    "breaker_threshold" => 5,
+    "origin" => %{"source" => "ops"},
+    "payload" => %{"target" => "proactive", "message" => %{"action" => "run"}},
+    "dedupe_key" => "crash-replay",
+    "created_by" => "ops",
+    "created_at" => crash_due - 300_000,
+    "updated_at" => crash_due
+  }
+}
+
+FakeStore.start([running_row])
+{state6b, _clock6b, sink6b} = init_state.(base_now, [], %{store_mod: FakeStore})
+{:reply, _tick6b, _state6b} = tick.(state6b, :ops)
+
+replayed6b =
+  sink6b
+  |> Agent.get(& &1)
+  |> List.first()
+  |> elem(2)
+  |> Jason.decode!()
+
+check.(
+  "coalesced running-job recovery keeps the pre-crash occurrence fire_id",
+  get_in(replayed6b, ["cron", "fire_id"]) == "100:#{crash_due}" and
+    get_in(replayed6b, ["cron", "scheduled_at"]) == crash_due and
+    get_in(replayed6b, ["cron", "attempt"]) == 2
+)
+
 # ── Vector 7: list rows carry "kind" and "paused_by" keys ──
 
 FakeStore.start([])

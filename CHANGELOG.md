@@ -26,6 +26,14 @@ versions do not track them 1:1.
 - Successful `create_job` and `update` replies expose `persistence` as
   `persisted`, `degraded`, or `memory_only`, so callers no longer confuse an
   in-memory acceptance with durable storage.
+- Trusted callers may provide a bounded opaque `request_id`; JSON replies echo
+  it for asynchronous object-to-object correlation.
+- Persisted `claimed_due` now survives coalesced running-job recovery, keeping
+  the occurrence `fire_id` stable across a scheduler crash. Skip recovery still
+  clears the abandoned claim before advancing to a future grid point.
+- Pause, resume, and delete replies now expose persistence status too. A failed
+  terminal write retains a non-runnable in-memory tombstone so the same delete
+  can be retried instead of losing its addressable job id.
 
 ### 0.2.7 — repo tag `v0.1.17` (2026-07-12, PR #12 `issue-11`)
 

@@ -62,6 +62,7 @@ cron_messages = fn -> Agent.get(cron_sink, &Enum.reverse(&1)) end
     :tg_ingress,
     Jason.encode!(%{
       action: "create_job",
+      request_id: "control:create:1",
       name: "target message smoke",
       run_at: cron_now,
       target: "test_sink",
@@ -74,7 +75,8 @@ cron_created = Jason.decode!(cron_create_reply)
 
 check.(
   "cron create_job accepts one allowlisted target message",
-  cron_created["ok"] == true and cron_created["job_id"] == 1
+  cron_created["ok"] == true and cron_created["job_id"] == 1 and
+    cron_created["request_id"] == "control:create:1"
 )
 
 {:reply, cron_dedupe_reply_1, cron_state} =

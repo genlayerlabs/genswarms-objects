@@ -468,9 +468,17 @@ defmodule CronJobRecoverTest do
   end
 
   test "recover/2 on a recurring job defaults to coalesce (fires now)" do
-    job = base_job(%{state: "running", schedule: every_5s(), misfire: "coalesce"})
+    job =
+      base_job(%{
+        state: "running",
+        schedule: every_5s(),
+        misfire: "coalesce",
+        claimed_due: 1_000
+      })
+
     recovered = Job.recover(job, 9_000)
     assert recovered.next_run_at == 9_000
+    assert recovered.claimed_due == 1_000
   end
 
   test "recover/2 with misfire \"skip\" advances to the next future grid point" do
@@ -485,6 +493,7 @@ defmodule CronJobRecoverTest do
 
     recovered = Job.recover(job, 9_000)
     assert recovered.next_run_at == 11_000
+    assert recovered.claimed_due == nil
   end
 
   test "recover/2 falls back to the coalesce recovery point instead of crashing on a poisoned skip expr (boot-crash guard)" do
@@ -494,12 +503,14 @@ defmodule CronJobRecoverTest do
         schedule: poisoned_cron(),
         misfire: "skip",
         last_run_at: 1_000,
-        created_at: 0
+        created_at: 0,
+        claimed_due: 1_000
       })
 
     recovered = Job.recover(job, 9_000)
     assert recovered.state == "active"
     assert recovered.next_run_at == 9_000
+    assert recovered.claimed_due == 1_000
   end
 
   test "recover/2 leaves a non-\"running\" job untouched" do

@@ -165,6 +165,7 @@ job2b_id = Jason.decode!(create2b)["job_id"]
 
 {:reply, update2b, state2b} =
   update.(state2b, :ops, job2b_id, %{
+    request_id: "control:update:#{job2b_id}",
     schedule: %{cron: "30 * * * *"},
     name: "new name",
     misfire: "skip",
@@ -179,6 +180,7 @@ updated2b = Map.fetch!(state2b.jobs, job2b_id)
 check.(
   "update changes schedule/name/run knobs in place, recomputes next fire, and refuses routing changes",
   Jason.decode!(update2b)["ok"] == true and
+    Jason.decode!(update2b)["request_id"] == "control:update:#{job2b_id}" and
     updated2b.id == job2b_id and
     updated2b.name == "new name" and
     updated2b.schedule == %{"kind" => "cron", "expr" => "30 * * * *"} and
