@@ -13,7 +13,7 @@ versions do not track them 1:1.
 
 ## cron (`packages/cron`, module `Genswarms.Cron`)
 
-### Unreleased — next package release
+### 0.2.8 — repo tag `v0.1.21` (2026-08-13, PR #19 `feat/cron-job-updates`)
 
 - `update` mutates an existing non-running job's schedule, name, misfire,
   attempt/backoff, and breaker settings without changing its identity, target,
