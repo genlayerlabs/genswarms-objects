@@ -53,6 +53,11 @@ end
 set_clock = fn clock, t -> Agent.update(clock, fn _ -> t end) end
 sink_messages = fn sink -> Agent.get(sink, &Enum.reverse/1) end
 
+decoded_sink_messages = fn sink ->
+  sink_messages.(sink)
+  |> Enum.map(fn {target, from, json} -> {target, from, Jason.decode!(json)} end)
+end
+
 # Same harness as new_state, but deliver_fn consults a toggle Agent: {:error, "boom"}
 # while true, a real sink-recording success while false — lets vectors flip a job's
 # delivery outcome mid-flight (fail-then-succeed retry vectors).
@@ -96,6 +101,11 @@ end
 
 run_now = fn state, from, id ->
   Cron.handle_message(from, Jason.encode!(%{action: "run_now", job_id: id}), state)
+end
+
+update = fn state, from, id, fields ->
+  msg = Map.merge(%{action: "update", job_id: id}, fields)
+  Cron.handle_message(from, Jason.encode!(msg), state)
 end
 
 defmodule CronKindsEventSink do
@@ -142,6 +152,43 @@ check.(
   decoded2a["ok"] == true and
     decoded2b["ok"] == false and
     String.contains?(decoded2b["error"] || "", "unsatisfiable")
+)
+
+# ── Vector 2b: mutable scheduler fields update in place; routing remains immutable ──
+
+{state2b, _clock2b, _sink2b} = new_state.(base_now)
+
+{:reply, create2b, state2b} =
+  create.(state2b, :ops, %{schedule: %{every_ms: 300_000}, name: "old name"})
+
+job2b_id = Jason.decode!(create2b)["job_id"]
+
+{:reply, update2b, state2b} =
+  update.(state2b, :ops, job2b_id, %{
+    schedule: %{cron: "30 * * * *"},
+    name: "new name",
+    misfire: "skip",
+    max_attempts: 7
+  })
+
+updated2b = Map.fetch!(state2b.jobs, job2b_id)
+
+{:reply, redirect2b, _state2b} =
+  update.(state2b, :ops, job2b_id, %{target: "somewhere_else"})
+
+check.(
+  "update changes schedule/name/run knobs in place, recomputes next fire, and refuses routing changes",
+  Jason.decode!(update2b)["ok"] == true and
+    updated2b.id == job2b_id and
+    updated2b.name == "new name" and
+    updated2b.schedule == %{"kind" => "cron", "expr" => "30 * * * *"} and
+    updated2b.next_run_at == base_now + 30 * 60_000 and
+    updated2b.misfire == "skip" and
+    updated2b.max_attempts == 7 and
+    Jason.decode!(redirect2b) == %{
+      "ok" => false,
+      "error" => "update contains unsupported fields"
+    }
 )
 
 # ── Vector 3: floor is every_ms-only ──
@@ -198,7 +245,20 @@ job5_after = Map.fetch!(state5.jobs, job5_id)
 check.(
   "recurring fire + re-arm: one delivery, job stays active, next_run_at advances one grid period, attempts reset to 0",
   decoded_tick5["launched"] == 1 and
-    sink_messages.(sink5) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
+    decoded_sink_messages.(sink5) == [
+      {:proactive, :cron,
+       %{
+         "action" => "run",
+         "cron" => %{
+           "attempt" => 1,
+           "fire_id" => "#{job5_id}:#{base_now + 300_000}",
+           "fired_at" => base_now + 300_000,
+           "instance" => "cron",
+           "job_id" => job5_id,
+           "scheduled_at" => base_now + 300_000
+         }
+       }}
+    ] and
     job5_after.state == "active" and
     job5_after.next_run_at == base_now + 600_000 and
     job5_after.attempts == 0
@@ -227,7 +287,7 @@ check.(
   "run_now on an ACTIVE every_ms job: trusted call delivers once now and permanently re-phases next_run_at from the run_now occurrence (now + period), not the old scheduled grid point",
   decoded_run5b["ok"] == true and
     decoded_run5b["launched"] == 1 and
-    sink_messages.(sink5b) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
+    match?([{:proactive, :cron, %{"action" => "run"}}], decoded_sink_messages.(sink5b)) and
     job5b_after.state == "active" and
     job5b_after.next_run_at == base_now + 120_000 + 300_000
 )
@@ -253,7 +313,7 @@ check.(
   "run_now on a cron-kind job: firing early delivers once now but leaves next_run_at on the same absolute grid point it already had (no re-phasing)",
   decoded_run5bc["ok"] == true and
     decoded_run5bc["launched"] == 1 and
-    sink_messages.(sink5bc) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}] and
+    match?([{:proactive, :cron, %{"action" => "run"}}], decoded_sink_messages.(sink5bc)) and
     job5bc_after.state == "active" and
     job5bc_before.next_run_at == base_now + 3_600_000 and
     job5bc_after.next_run_at == job5bc_before.next_run_at
@@ -343,7 +403,7 @@ set_clock.(clock7b, base_now + 60_000)
 check.(
   "handle_info(:tick) returns noreply and still runs due jobs through the shared tick core",
   not Map.has_key?(state7b.jobs, job7b_id) and
-    sink_messages.(sink7b) == [{:proactive, :cron, Jason.encode!(%{"action" => "run"})}]
+    match?([{:proactive, :cron, %{"action" => "run"}}], decoded_sink_messages.(sink7b))
 )
 
 # ── Vector 8: recurring occurrence exhaustion → active, consecutive_failures 1, grid next ──

@@ -81,13 +81,15 @@ create = fn state, name ->
 end
 
 {:ok, memory_state} = Cron.init(config)
-{:reply, _reply, _memory_state} = create.(memory_state, "memory only")
+{:reply, memory_reply, _memory_state} = create.(memory_state, "memory only")
 {:ok, partial_state} = Cron.init(Map.put(config, :store_mod, CronPersistencePartialStore))
-{:reply, _reply, _partial_state} = create.(partial_state, "partial store")
+{:reply, partial_reply, _partial_state} = create.(partial_state, "partial store")
 
 check.(
-  "missing Store or save callback stays silent memory-only mode",
-  CronPersistenceEvents.all() == []
+  "missing Store or save callback stays silent and reports memory-only acceptance",
+  CronPersistenceEvents.all() == [] and
+    Jason.decode!(memory_reply)["persistence"] == "memory_only" and
+    Jason.decode!(partial_reply)["persistence"] == "memory_only"
 )
 
 CronPersistenceEvents.reset()
@@ -102,6 +104,7 @@ failed_metadata = failed_opts[:metadata]
 check.(
   "explicit save error keeps the job and emits one safe failure event",
   Map.has_key?(state.jobs, job_id) and
+    Jason.decode!(create_reply)["persistence"] == "degraded" and
     failed_metadata == %{
       operation: :save_cron_job,
       job_id: job_id,
