@@ -5,7 +5,7 @@ defmodule Genswarms.Cron do
   This object is deliberately not market-scoped. A job is one schedule — a
   one-shot datetime, a fixed-rate `every_ms` interval, or a 5-field UTC cron
   expression — plus one stamped message to one allowlisted target. It owns timing, concurrency,
-  persistence, and audit; target objects still own domain authority.
+  persistence, occurrence identity, and audit; target objects still own domain authority.
   """
 
   require Logger
@@ -87,6 +87,11 @@ defmodule Genswarms.Cron do
         input: ~s({"action":"pause","job_id":1}),
         output: ~s({"ok":true,"job_id":1,"state":"paused"})
       },
+      update: %{
+        input:
+          ~s({"action":"update","job_id":1,"schedule":{"cron":"0 9 * * *"},"name":"morning report"}),
+        output: ~s({"ok":true,"job_id":1,"state":"active","next_run_at":1780995600000})
+      },
       resume: %{
         input: ~s({"action":"resume","job_id":1}),
         output: ~s({"ok":true,"job_id":1,"state":"active"})
@@ -117,9 +122,25 @@ defmodule Genswarms.Cron do
         do: {:reply, Jason.encode!(%{ok: false, error: "message_too_large"}), state},
         else: {:noreply, state}
     else
-      handle_decoded_message(from, Jason.decode(content), state)
+      decoded = Jason.decode(content)
+
+      from
+      |> handle_decoded_message(decoded, state)
+      |> echo_request_id(decoded)
     end
   end
+
+  # Trusted object callers often use the ordinary asynchronous object route.
+  # Echoing their opaque request id lets them correlate the routed reply without
+  # granting any scheduling authority to that id. Invalid/oversized ids are
+  # ignored and never change the underlying action result.
+  defp echo_request_id({:reply, response, state}, {:ok, %{"request_id" => request_id}})
+       when is_binary(request_id) and byte_size(request_id) in 1..200 do
+    stamped = response |> Jason.decode!() |> Map.put("request_id", request_id) |> Jason.encode!()
+    {:reply, stamped, state}
+  end
+
+  defp echo_request_id(result, _decoded), do: result
 
   defp handle_decoded_message(from, decoded, state) do
     case decoded do
@@ -128,6 +149,9 @@ defmodule Genswarms.Cron do
 
       {:ok, %{"action" => "pause", "job_id" => id}} ->
         if trusted?(from, state), do: set_job_state(id, "paused", state), else: {:noreply, state}
+
+      {:ok, %{"action" => "update", "job_id" => id} = msg} ->
+        if trusted?(from, state), do: update_job(id, msg, state), else: {:noreply, state}
 
       {:ok, %{"action" => "resume", "job_id" => id}} ->
         if trusted?(from, state), do: resume_job(id, state), else: {:noreply, state}
@@ -276,7 +300,8 @@ defmodule Genswarms.Cron do
            ok: true,
            job_id: job.id,
            state: job.state,
-           next_run_at: job.next_run_at
+           next_run_at: job.next_run_at,
+           persistence: persistence_status(state, job.id)
          }), arm_timer(state, now)}
 
       {:error, reason} ->
@@ -560,6 +585,9 @@ defmodule Genswarms.Cron do
       target == "" or action == "" ->
         {:error, "create_job needs target and message.action"}
 
+      Map.has_key?(message, "cron") ->
+        {:error, "reserved_key"}
+
       not allowed_target_action?(target, action, state) ->
         {:error, "cron target #{target}.#{action} is not allowlisted"}
 
@@ -687,7 +715,7 @@ defmodule Genswarms.Cron do
     started = state.now_fn.()
 
     try do
-      case dispatch(job, state) do
+      case dispatch(job, state, started) do
         :ok ->
           %{status: "ok", started_at: started, finished_at: state.now_fn.(), error: nil}
 
@@ -710,9 +738,20 @@ defmodule Genswarms.Cron do
     end
   end
 
-  defp dispatch(%{payload: %{"target" => target, "message" => message}}, state) do
+  defp dispatch(%{payload: %{"target" => target, "message" => message}} = job, state, fired_at) do
     target_atom = Map.fetch!(state.allowed_targets.targets, target)
-    state.deliver_fn.(target_atom, state.name, Jason.encode!(message))
+    scheduled_at = job.claimed_due || job.last_run_at || fired_at
+
+    envelope = %{
+      "job_id" => job.id,
+      "fire_id" => "#{job.id}:#{scheduled_at}",
+      "scheduled_at" => scheduled_at,
+      "fired_at" => fired_at,
+      "attempt" => job.attempts,
+      "instance" => to_string(state.name)
+    }
+
+    state.deliver_fn.(target_atom, state.name, Jason.encode!(Map.put(message, "cron", envelope)))
   end
 
   defp finish_run(job_id, result, state) do
@@ -806,21 +845,142 @@ defmodule Genswarms.Cron do
           job ->
             job = %{job | state: new_state, updated_at: state.now_fn.()}
 
-            jobs =
-              if new_state in @terminal_states,
-                do: Map.delete(state.jobs, id),
-                else: Map.put(state.jobs, id, job)
+            state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
+            persistence = persistence_status(state, id)
 
-            state = persist_job(%{state | jobs: jobs}, job)
+            # Keep a failed terminal tombstone addressable in memory so the
+            # caller can retry the same delete. Once the write succeeds (or no
+            # durable callback exists), remove it from the runnable projection.
+            state =
+              if new_state in @terminal_states and persistence != "degraded",
+                do: %{state | jobs: Map.delete(state.jobs, id)},
+                else: state
 
-            {:reply, Jason.encode!(%{ok: true, job_id: id, state: new_state}),
-             arm_timer(state, state.now_fn.())}
+            {:reply,
+             Jason.encode!(%{
+               ok: true,
+               job_id: id,
+               state: new_state,
+               persistence: persistence
+             }), arm_timer(state, state.now_fn.())}
         end
 
       {:error, reason} ->
         {:reply, Jason.encode!(%{ok: false, error: reason}), state}
     end
   end
+
+  @update_keys MapSet.new([
+                 "action",
+                 "job_id",
+                 "name",
+                 "schedule",
+                 "misfire",
+                 "max_attempts",
+                 "retry_backoff_ms",
+                 "breaker_threshold",
+                 "request_id"
+               ])
+
+  defp update_job(raw_id, msg, state) do
+    with {:ok, id} <- job_id(raw_id),
+         {:ok, job} <- fetch_updatable_job(id, state),
+         :ok <- validate_update_fields(msg),
+         {:ok, updated} <- build_updated_job(job, msg, state) do
+      state = persist_job(%{state | jobs: Map.put(state.jobs, id, updated)}, updated)
+
+      {:reply,
+       Jason.encode!(%{
+         ok: true,
+         job_id: id,
+         state: updated.state,
+         next_run_at: updated.next_run_at,
+         persistence: persistence_status(state, id)
+       }), arm_timer(state, state.now_fn.())}
+    else
+      {:error, reason} ->
+        {:reply, Jason.encode!(%{ok: false, error: reason}), state}
+    end
+  end
+
+  defp fetch_updatable_job(id, state) do
+    case Map.get(state.jobs, id) do
+      nil -> {:error, "job not found"}
+      %{state: "running"} -> {:error, "job is running"}
+      %{state: state_name} when state_name in @terminal_states -> {:error, "job terminal"}
+      job -> {:ok, job}
+    end
+  end
+
+  defp validate_update_fields(msg) do
+    extra = msg |> Map.keys() |> Enum.reject(&MapSet.member?(@update_keys, &1))
+    changed = msg |> Map.drop(["action", "job_id", "request_id"]) |> map_size()
+
+    cond do
+      extra != [] ->
+        {:error, "update contains unsupported fields"}
+
+      changed == 0 ->
+        {:error, "update needs at least one mutable field"}
+
+      Map.has_key?(msg, "name") and not is_binary(msg["name"]) ->
+        {:error, "name must be a string"}
+
+      Map.has_key?(msg, "misfire") and msg["misfire"] not in ["skip", "coalesce"] ->
+        {:error, "misfire must be skip or coalesce"}
+
+      invalid_positive_update?(msg, "max_attempts") ->
+        {:error, "max_attempts must be positive"}
+
+      invalid_nonnegative_update?(msg, "retry_backoff_ms") ->
+        {:error, "retry_backoff_ms must be non-negative"}
+
+      invalid_positive_update?(msg, "breaker_threshold") ->
+        {:error, "breaker_threshold must be positive"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp invalid_positive_update?(msg, key),
+    do: Map.has_key?(msg, key) and not (is_integer(msg[key]) and msg[key] > 0)
+
+  defp invalid_nonnegative_update?(msg, key),
+    do: Map.has_key?(msg, key) and not (is_integer(msg[key]) and msg[key] >= 0)
+
+  defp build_updated_job(job, msg, state) do
+    now = state.now_fn.()
+
+    with {:ok, schedule, next_run_at} <- updated_schedule(job, msg, state, now) do
+      {:ok,
+       %{
+         job
+         | name: if(Map.has_key?(msg, "name"), do: safe_text(msg["name"], 120), else: job.name),
+           schedule: schedule,
+           next_run_at: next_run_at,
+           misfire: Map.get(msg, "misfire", job.misfire),
+           max_attempts: Map.get(msg, "max_attempts", job.max_attempts),
+           retry_backoff_ms: Map.get(msg, "retry_backoff_ms", job.retry_backoff_ms),
+           breaker_threshold: Map.get(msg, "breaker_threshold", job.breaker_threshold),
+           attempts: 0,
+           claimed_due: nil,
+           updated_at: now
+       }}
+    end
+  end
+
+  defp updated_schedule(_job, %{"schedule" => schedule}, state, now) do
+    with {:ok, norm} <- Schedule.normalize(schedule, now),
+         :ok <- check_floor(norm, state),
+         :ok <- check_not_past(norm, now, state),
+         {:ok, next_run_at} <- Schedule.first_run_at(norm, now) do
+      {:ok, norm, next_run_at}
+    end
+  end
+
+  defp updated_schedule(job, _msg, _state, _now),
+    do: {:ok, job.schedule, job.next_run_at}
 
   defp resume_job(id, state) do
     case job_id(id) do
@@ -851,7 +1011,13 @@ defmodule Genswarms.Cron do
     if job.next_run_at do
       state = persist_job(%{state | jobs: Map.put(state.jobs, id, job)}, job)
 
-      {:reply, Jason.encode!(%{ok: true, job_id: id, state: "active"}), arm_timer(state, now)}
+      {:reply,
+       Jason.encode!(%{
+         ok: true,
+         job_id: id,
+         state: "active",
+         persistence: persistence_status(state, id)
+       }), arm_timer(state, now)}
     else
       {:reply, Jason.encode!(%{ok: false, error: "job has no future run_at"}), state}
     end
@@ -905,6 +1071,14 @@ defmodule Genswarms.Cron do
     end
   end
 
+  defp persistence_status(state, job_id) do
+    cond do
+      not store_callback?(state.store_mod, :save_cron_job, 1) -> "memory_only"
+      MapSet.member?(state.persistence_failures, job_id) -> "degraded"
+      true -> "persisted"
+    end
+  end
+
   # A bare :error is a common enough store convention that leaving it invisible
   # is a trap — normalize it into the reported shape.
   defp persistence_transition(state, job, :error),
@@ -914,8 +1088,7 @@ defmodule Genswarms.Cron do
     unless MapSet.member?(state.persistence_failures, job.id) do
       emit_event(state, :job_persistence_failed, "Scheduled job persistence failed",
         swarm: state.swarm_name,
-        metadata:
-          Map.put(persistence_metadata(job), :error, safe_text(inspect(reason), 120))
+        metadata: Map.put(persistence_metadata(job), :error, safe_text(inspect(reason), 120))
       )
     end
 
@@ -1049,7 +1222,7 @@ defmodule Genswarms.Cron do
       max_attempts: to_id(data["max_attempts"]) || 3,
       retry_backoff_ms: to_id(data["retry_backoff_ms"]) || 60_000,
       breaker_threshold: to_id(data["breaker_threshold"]) || 5,
-      claimed_due: nil,
+      claimed_due: to_id(data["claimed_due"]),
       origin: data["origin"] || %{},
       payload: data["payload"] || %{},
       dedupe_key: data["dedupe_key"],
@@ -1322,7 +1495,9 @@ defmodule Genswarms.Cron do
   defp describe_schedule(%{"kind" => "every_ms", "every_ms" => ms}) when is_integer(ms),
     do: "every #{div(ms, 1000)}s"
 
-  defp describe_schedule(%{"kind" => "run_at", "run_at_ms" => ms}), do: "once @ " <> format_run_at(ms)
+  defp describe_schedule(%{"kind" => "run_at", "run_at_ms" => ms}),
+    do: "once @ " <> format_run_at(ms)
+
   defp describe_schedule(%{"cron" => expr}), do: "cron " <> to_string(expr)
   defp describe_schedule(%{"every_ms" => ms}) when is_integer(ms), do: "every #{div(ms, 1000)}s"
   defp describe_schedule(%{"run_at" => at}), do: "once @ " <> format_run_at(at)

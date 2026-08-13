@@ -12,7 +12,8 @@ defmodule Genswarms.Cron.Store do
 
   See the "Store seam contract" section in SKILL.md / README.md for the
   full narrative: the atom-vs-string key split, callback failure semantics,
-  the JSON round-trip, and why `claimed_due` never survives a reload.
+  the JSON round-trip, and why `claimed_due` must survive a running-job reload
+  so coalesced crash recovery keeps the same occurrence identity.
   """
 
   @typedoc """

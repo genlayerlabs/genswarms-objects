@@ -44,8 +44,8 @@ authority (they validate the message they receive).
 empty `allowed_targets` (nothing deliverable). Both are the package's security
 posture — declare them, don't patch the module.
 
-Object protocol: `create_job` / `list` / `pause` / `resume` / `delete` / `tick`
-/ `status` / `run_now`. A trusted sender's decoded JSON with an unrecognized
+Object protocol: `create_job` / `update` / `list` / `pause` / `resume` /
+`delete` / `tick` / `status` / `run_now`. A trusted sender's decoded JSON with an unrecognized
 `"action"` gets `{ok:false, error:"unknown_action"}` (typo/version-skew
 guard); malformed JSON or an untrusted sender is always a silent drop —
 `interface/0` enumerates the full action set with neutral examples.
@@ -59,6 +59,16 @@ must be scalar strings; non-scalar values are rejected `ok:false`, never
 coerced. Inbound messages over `max_message_bytes` (default 65536) are
 rejected `{ok:false, error:"message_too_large"}` for a trusted sender and
 silently dropped for an untrusted one.
+
+Trusted callers may attach a string `request_id` of at most 200 bytes. Every
+JSON reply echoes it unchanged, which lets asynchronous object callers
+correlate the response. It has no effect on authorization, job identity, or
+dedupe.
+
+Successful create, update, pause, resume, and delete replies include
+`persistence`: `persisted`, `degraded`, or `memory_only`. A degraded delete is
+safe to retry by the same job id; the scheduler retains a non-runnable
+tombstone until that terminal write succeeds.
 
 ## Create envelope
 
@@ -85,6 +95,21 @@ depending on them and may be removed.
 `{"campaign_id": "c1", "score": 7}` — persisted on the job for audit; any
 non-scalar value is dropped, and `"source"` defaults to the creating
 sender if not supplied.
+
+Successful live creation reports `"persistence":"persisted"` when the Store
+save succeeded, `"degraded"` when the job is running only in memory after a
+save failure, and `"memory_only"` when no save callback is configured.
+
+## Update
+
+`{"action":"update","job_id":1,"schedule":{"cron":"0 9 * * *"}}`
+updates an existing active or paused job in place. Mutable fields are `schedule`,
+`name`, `misfire`, `max_attempts`, `retry_backoff_ms`, and
+`breaker_threshold`. Routing and attribution fields (`target`, `message`,
+`origin`, `created_by`, `dedupe_key`) are intentionally immutable; changing
+those means creating a new job. Running jobs reject updates. A changed schedule
+is normalized with the same parser/floors as creation and re-arms from the
+update instant. The reply includes the same `persistence` status as creation.
 
 ## Declarative seeding
 
@@ -175,6 +200,20 @@ that trips the breaker additionally emits `:job_breaker_paused` (job name,
 consecutive_failures). These are the only failure-observability signal
 under the default `deliver_fn` — see "Delivery is at-most-once" below for
 why `max_attempts`/breaker tuning otherwise has nothing to react to.
+
+## Occurrence envelope
+
+Every delivered message gains a reserved `cron` map:
+
+```json
+{"cron":{"job_id":7,"fire_id":"7:1751450400000","scheduled_at":1751450400000,"fired_at":1751450400213,"attempt":1,"instance":"cron"}}
+```
+
+`fire_id` is stable across retries and coalesced scheduler-crash recovery of one
+scheduled occurrence, so a target can
+deduplicate domain work. `attempt` increments per delivery attempt. Creation
+rejects a message that already contains `cron`; callers cannot forge scheduler
+identity.
 
 ## Delivery is at-most-once by default — retry/breaker governs a narrower case than it sounds
 

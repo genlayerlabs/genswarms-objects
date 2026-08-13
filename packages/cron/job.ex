@@ -251,29 +251,34 @@ defmodule Genswarms.Cron.Job do
   def recover(%{state: "running"} = job, now) do
     schedule = Map.get(job, :schedule)
 
-    next_run_at =
+    {next_run_at, skip_occurrence?} =
       if Schedule.recurring?(schedule) do
         case job.misfire do
           "skip" ->
             case Schedule.next_after(schedule, job.last_run_at || job.created_at, now) do
-              {:ok, next} -> next
+              {:ok, next} -> {next, true}
               # :none or {:error, _} (poisoned stored expr): fall back to the
               # coalesce recovery point instead of crashing init — the run's
               # completion then parks the job terminal with the reason.
-              _no_next -> now
+              _no_next -> {now, false}
             end
 
           _coalesce ->
-            now
+            {now, false}
         end
       else
-        now
+        {now, false}
       end
 
     %{
       job
       | state: "active",
         next_run_at: next_run_at,
+        # A coalesced crash replay must retain the original due point so its
+        # occurrence identity is identical to the pre-crash handoff. A skip
+        # recovery deliberately abandons that occurrence, so its claim must not
+        # leak into the next future grid point.
+        claimed_due: if(skip_occurrence?, do: nil, else: job.claimed_due),
         last_status: "recovered",
         last_error: "scheduler restarted while job was running",
         updated_at: now

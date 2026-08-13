@@ -62,6 +62,7 @@ cron_messages = fn -> Agent.get(cron_sink, &Enum.reverse(&1)) end
     :tg_ingress,
     Jason.encode!(%{
       action: "create_job",
+      request_id: "control:create:1",
       name: "target message smoke",
       run_at: cron_now,
       target: "test_sink",
@@ -74,7 +75,8 @@ cron_created = Jason.decode!(cron_create_reply)
 
 check.(
   "cron create_job accepts one allowlisted target message",
-  cron_created["ok"] == true and cron_created["job_id"] == 1
+  cron_created["ok"] == true and cron_created["job_id"] == 1 and
+    cron_created["request_id"] == "control:create:1"
 )
 
 {:reply, cron_dedupe_reply_1, cron_state} =
@@ -115,9 +117,20 @@ check.(
 interface_actions = Cron.interface() |> Map.keys() |> Enum.sort()
 
 check.(
-  "cron interface declares every public action including run_now with neutral examples",
-  interface_actions == [:create_job, :delete, :list, :pause, :resume, :run_now, :status, :tick] and
+  "cron interface declares every public action including update/run_now with neutral examples",
+  interface_actions == [
+    :create_job,
+    :delete,
+    :list,
+    :pause,
+    :resume,
+    :run_now,
+    :status,
+    :tick,
+    :update
+  ] and
     String.contains?(Cron.interface().create_job.input, "\"target\":\"reporter\"") and
+    String.contains?(Cron.interface().update.input, "\"action\":\"update\"") and
     String.contains?(Cron.interface().run_now.input, "\"action\":\"run_now\"")
 )
 
@@ -165,14 +178,47 @@ check.(
   Cron.handle_message(:tg_ingress, Jason.encode!(%{action: "tick"}), cron_state)
 
 check.(
-  "cron tick launches a due datetime job",
+  "cron tick launches a due datetime job with deterministic occurrence identity",
   Jason.decode!(cron_tick_reply)["launched"] == 1 and
-    cron_messages.() == [{:test_sink, :cron, %{"action" => "do_work", "value" => 42}}]
+    cron_messages.() == [
+      {:test_sink, :cron,
+       %{
+         "action" => "do_work",
+         "value" => 42,
+         "cron" => %{
+           "job_id" => 1,
+           "fire_id" => "1:#{cron_now}",
+           "scheduled_at" => cron_now,
+           "fired_at" => cron_now,
+           "attempt" => 1,
+           "instance" => "cron"
+         }
+       }}
+    ]
+)
+
+{:reply, reserved_reply, _reserved_state} =
+  Cron.handle_message(
+    :tg_ingress,
+    Jason.encode!(%{
+      action: "create_job",
+      run_at: cron_now + 60_000,
+      target: "test_sink",
+      message: %{"action" => "do_work", "cron" => %{"job_id" => 999}}
+    }),
+    cron_state
+  )
+
+check.(
+  "cron rejects creator-supplied occurrence envelopes",
+  Jason.decode!(reserved_reply) == %{"ok" => false, "error" => "reserved_key"}
 )
 
 {:ok, retry_attempts} = Agent.start_link(fn -> 0 end)
+{:ok, retry_payloads} = Agent.start_link(fn -> [] end)
 
-retry_deliver = fn _target, _from, _content ->
+retry_deliver = fn _target, _from, content ->
+  Agent.update(retry_payloads, &[Jason.decode!(content) | &1])
   attempt = Agent.get_and_update(retry_attempts, &{&1 + 1, &1 + 1})
   if attempt == 1, do: {:error, "temporary outage"}, else: :ok
 end
@@ -224,9 +270,18 @@ Agent.update(cron_clock, fn _ -> cron_now + 1_000 end)
   Cron.handle_message(:tg_ingress, Jason.encode!(%{action: "tick"}), retry_state)
 
 check.(
-  "cron removes one-shot jobs only after successful target handoff",
+  "cron removes one-shot jobs only after successful target handoff and retries retain fire_id",
   Jason.decode!(retry_success_reply)["launched"] == 1 and
-    not Map.has_key?(retry_state.jobs, retry_job_id) and Agent.get(retry_attempts, & &1) == 2
+    not Map.has_key?(retry_state.jobs, retry_job_id) and Agent.get(retry_attempts, & &1) == 2 and
+    case Agent.get(retry_payloads, &Enum.reverse/1) do
+      [first, second] ->
+        get_in(first, ["cron", "fire_id"]) == get_in(second, ["cron", "fire_id"]) and
+          get_in(first, ["cron", "attempt"]) == 1 and
+          get_in(second, ["cron", "attempt"]) == 2
+
+      _ ->
+        false
+    end
 )
 
 Agent.update(cron_clock, fn _ -> cron_now end)

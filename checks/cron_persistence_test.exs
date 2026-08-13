@@ -81,13 +81,15 @@ create = fn state, name ->
 end
 
 {:ok, memory_state} = Cron.init(config)
-{:reply, _reply, _memory_state} = create.(memory_state, "memory only")
+{:reply, memory_reply, _memory_state} = create.(memory_state, "memory only")
 {:ok, partial_state} = Cron.init(Map.put(config, :store_mod, CronPersistencePartialStore))
-{:reply, _reply, _partial_state} = create.(partial_state, "partial store")
+{:reply, partial_reply, _partial_state} = create.(partial_state, "partial store")
 
 check.(
-  "missing Store or save callback stays silent memory-only mode",
-  CronPersistenceEvents.all() == []
+  "missing Store or save callback stays silent and reports memory-only acceptance",
+  CronPersistenceEvents.all() == [] and
+    Jason.decode!(memory_reply)["persistence"] == "memory_only" and
+    Jason.decode!(partial_reply)["persistence"] == "memory_only"
 )
 
 CronPersistenceEvents.reset()
@@ -102,6 +104,7 @@ failed_metadata = failed_opts[:metadata]
 check.(
   "explicit save error keeps the job and emits one safe failure event",
   Map.has_key?(state.jobs, job_id) and
+    Jason.decode!(create_reply)["persistence"] == "degraded" and
     failed_metadata == %{
       operation: :save_cron_job,
       job_id: job_id,
@@ -168,14 +171,28 @@ CronPersistenceStore.mode(:error)
 {:reply, _reply, state} =
   Cron.handle_message(:ops, Jason.encode!(%{action: "resume", job_id: job_id}), state)
 
-{:reply, _reply, state} =
+{:reply, delete_failed_reply, state} =
   Cron.handle_message(:ops, Jason.encode!(%{action: "delete", job_id: job_id}), state)
 
 check.(
-  "a terminal save failure emits once without retaining an unrecoverable ID",
-  not Map.has_key?(state.jobs, job_id) and
-    not MapSet.member?(state.persistence_failures, job_id) and
+  "a terminal save failure retains a retryable tombstone",
+  Jason.decode!(delete_failed_reply)["persistence"] == "degraded" and
+    Map.fetch!(state.jobs, job_id).state == "deleted" and
+    MapSet.member?(state.persistence_failures, job_id) and
     Enum.count(CronPersistenceEvents.all(), &(elem(&1, 1) == :job_persistence_failed)) == 6
+)
+
+CronPersistenceStore.mode(:ok)
+
+{:reply, delete_recovered_reply, state} =
+  Cron.handle_message(:ops, Jason.encode!(%{action: "delete", job_id: job_id}), state)
+
+check.(
+  "retrying a terminal write removes the tombstone only after persistence recovers",
+  Jason.decode!(delete_recovered_reply)["persistence"] == "persisted" and
+    not Map.has_key?(state.jobs, job_id) and
+    not MapSet.member?(state.persistence_failures, job_id) and
+    Enum.count(CronPersistenceEvents.all(), &(elem(&1, 1) == :job_persistence_recovered)) == 6
 )
 
 case Agent.get(failures, &Enum.reverse/1) do
