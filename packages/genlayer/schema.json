@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "actions": {
+    "describe": {"required": [], "optional": [], "description": "Discover your wallet, network, available operations and limits. Does not create a wallet."},
+    "balance": {"required": [], "optional": [], "description": "Read native spendable balance; pending execution is reported separately. Amounts are integer base-unit strings."},
+    "assets": {"required": [], "optional": [], "description": "List host-configured contract recipes and assets. This is not an exhaustive token index."},
+    "read": {"required": ["recipe"], "optional": ["args"], "description": "Read a host-configured EVM or intelligent-contract view."},
+    "prepare": {"required": ["recipe", "request_id"], "optional": ["args"], "description": "Simulate an allowed EVM action and save an expiring, wallet-bound proposal. Does not sign or send."},
+    "submit": {"required": ["prepared_id"], "optional": [], "description": "Submit exactly one prepared proposal. Repeated submission returns the existing execution; never create another to retry a timeout."},
+    "status": {"required": ["prepared_id"], "optional": [], "description": "Reconcile a proposal against canonical receipts and configured confirmations. Unknown submissions remain pending."}
+  }
+}
