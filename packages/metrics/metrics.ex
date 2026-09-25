@@ -6,11 +6,17 @@ defmodule Genswarms.Metrics do
 
       {"action":"bump","key":"reply_sent"}      # optional "n" (default 1)
 
-  This object accumulates the deltas in memory and, on a timer, FLUSHES them into
-  the durable `metrics_daily` table (count += delta, keyed by the host-local day), then logs a
-  one-line summary. Folding by delta means daily totals survive an orchestrator
-  restart (at most one un-flushed window is lost). Read with `scripts/metrics.sh`
-  or by querying `metrics_daily`.
+  With `add_metrics_batch/3`, every bump attempts persistence immediately, stamped
+  with its UTC event day and a unique batch ID. The store must atomically deduplicate
+  that ID and increment the deltas, returning `:ok` only after commit. Failed or
+  ambiguous attempts retain their original ID/day/payload for retry on the next
+  bump or timer. Successfully committed counts survive an object restart.
+
+  Pending writes are MEMORY ONLY: a process crash during an outage can lose them.
+  One attempted batch is immutable; later bumps coalesce by UTC day and closed key.
+  Memory therefore grows with outage days, not event volume. Fire-and-forget messages
+  can also be lost before handling. Legacy `add_metrics/1` stores retain periodic,
+  best-effort writes without atomic retry or event-day guarantees.
 
   ## Known keys (v1)
     - `reply_sent`       — sender delivered a conversational reply
@@ -45,14 +51,15 @@ defmodule Genswarms.Metrics do
   unbounded random keys. Add new LEGIT keys to the allowlist above.
 
   ## Why it's safe to leave always-on
-  A bump is a fire-and-forget cast off the hot path; the counts maps are bounded by
-  the small fixed key set (no unbounded growth); and with persistence disabled the
+  A bump is a fire-and-forget cast off the caller's hot path; totals are bounded by
+  the fixed key set (outage buffers additionally grow per UTC day); with persistence disabled the
   flush is a no-op (counts still accumulate + log since boot). If this object is
   down, callers' bumps just drop — nothing else breaks.
 
   ## Config
     - `flush_ms` — flush + log period in ms (default 300_000 = 5 min). `nil`/0 to
-      disable the timer (drive `:flush` manually, e.g. in tests).
+      disable the retry/log timer (drive `:flush` manually, e.g. in tests).
+    - `now_fn` — UTC DateTime clock (default `DateTime.utc_now/0`).
   """
 
   require Logger
@@ -96,18 +103,25 @@ defmodule Genswarms.Metrics do
   # Host-declared keys extend the baseline — STILL a closed set (pure data in the
   # swarm config), never an open prefix: the anti-amplification posture holds.
   def allowed_key?(key, extra \\ MapSet.new())
-  def allowed_key?(key, extra) when is_binary(key), do: key in @known_keys or MapSet.member?(extra, key)
+
+  def allowed_key?(key, extra) when is_binary(key),
+    do: key in @known_keys or MapSet.member?(extra, key)
+
   def allowed_key?(_, _), do: false
 
   def init(config) do
     flush_ms = Map.get(config, :flush_ms, @default_flush_ms)
     if is_integer(flush_ms) and flush_ms > 0, do: Process.send_after(self(), :flush, flush_ms)
-    # pending: deltas accumulated since the last flush (cleared on flush).
+    # pending: all unacknowledged deltas, including the immutable retry batch.
     # totals:  cumulative since boot (for the snapshot / ad-hoc introspection).
     {:ok,
      %{
        pending: %{},
        totals: %{},
+       queued_days: %{},
+       batch: nil,
+       last_error: nil,
+       now_fn: Map.get(config, :now_fn, &DateTime.utc_now/0),
        flush_ms: flush_ms,
        store: module_ref(Map.get(config, :store)),
        extra_keys: MapSet.new(Map.get(config, :extra_keys, []) |> Enum.map(&to_string/1))
@@ -161,7 +175,8 @@ defmodule Genswarms.Metrics do
           Jason.encode!(%{
             totals: state.totals,
             pending: state.pending,
-            today: store_today(state.store, state.totals)
+            today: store_today(state.store, state.totals),
+            persistence: %{status: persistence_status(state), last_error: state.last_error}
           })
 
         {:reply, reply, state}
@@ -183,32 +198,116 @@ defmodule Genswarms.Metrics do
   # ── internals ────────────────────────────────────────────────────────────────
 
   defp bump(state, key, amount) do
-    %{
+    state = %{
       state
       | pending: Map.update(state.pending, key, amount, &(&1 + amount)),
         totals: Map.update(state.totals, key, amount, &(&1 + amount))
     }
+
+    if store?(state.store, :add_metrics_batch, 3) do
+      day = state.now_fn.() |> DateTime.to_date()
+
+      queued =
+        Map.update(state.queued_days, day, %{key => amount}, fn deltas ->
+          Map.update(deltas, key, amount, &(&1 + amount))
+        end)
+
+      persist_batches(%{state | queued_days: queued})
+    else
+      state
+    end
   end
 
-  # Persist accumulated deltas to today's durable counters, then log a summary.
-  # Clears `pending` only after the write is attempted (a disabled store no-ops the
-  # add but we still clear — those deltas remain in `totals` for the boot-session view).
-  defp flush(%{pending: pending} = state) do
-    if map_size(pending) > 0 and store?(state.store, :add_metrics, 1), do: state.store.add_metrics(pending)
-    state = %{state | pending: %{}}
+  defp flush(state) do
+    state =
+      cond do
+        store?(state.store, :add_metrics_batch, 3) ->
+          persist_batches(state)
+
+        map_size(state.pending) == 0 ->
+          state
+
+        store?(state.store, :add_metrics, 1) ->
+          case safe_write(state.store, :add_metrics, [state.pending]) do
+            :ok -> %{state | pending: %{}, last_error: nil}
+            _ -> %{state | last_error: "write_failed"}
+          end
+
+        true ->
+          %{state | pending: %{}}
+      end
+
     log_summary(state.store)
     state
+  end
+
+  defp persist_batches(%{batch: nil, queued_days: days} = state) when map_size(days) == 0,
+    do: state
+
+  defp persist_batches(%{batch: nil} = state) do
+    # ponytail: one map per outage day; use a durable outbox if outage crash recovery is required.
+    {day, deltas} = Enum.min_by(state.queued_days, fn {day, _} -> Date.to_gregorian_days(day) end)
+    id = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+
+    persist_batches(%{
+      state
+      | batch: {id, day, deltas},
+        queued_days: Map.delete(state.queued_days, day)
+    })
+  end
+
+  defp persist_batches(%{batch: {id, day, deltas}} = state) do
+    case safe_write(state.store, :add_metrics_batch, [id, day, deltas]) do
+      :ok ->
+        pending =
+          Enum.reduce(deltas, state.pending, fn {key, amount}, pending ->
+            case pending[key] - amount do
+              0 -> Map.delete(pending, key)
+              remaining -> Map.put(pending, key, remaining)
+            end
+          end)
+
+        persist_batches(%{state | batch: nil, pending: pending, last_error: nil})
+
+      _ ->
+        %{state | last_error: "write_failed"}
+    end
+  end
+
+  defp safe_write(store, callback, args) do
+    apply(store, callback, args)
+  rescue
+    _ -> {:error, :write_failed}
+  catch
+    _, _ -> {:error, :write_failed}
+  end
+
+  defp persistence_status(state) do
+    cond do
+      store?(state.store, :add_metrics_batch, 3) ->
+        if map_size(state.pending) == 0, do: "persisted", else: "pending"
+
+      store?(state.store, :add_metrics, 1) ->
+        "best_effort"
+
+      true ->
+        "memory_only"
+    end
   end
 
   defp log_summary(store) do
     today = store_today(store, %{})
 
-    summary =
-      @summary_keys
-      |> Enum.map(fn k -> "#{k}=#{Map.get(today, k, 0)}" end)
-      |> Enum.join(" ")
+    if is_map(today) do
+      summary =
+        @summary_keys
+        |> Enum.map(fn k -> "#{k}=#{Map.get(today, k, 0)}" end)
+        |> Enum.join(" ")
 
-    Logger.info("[metrics] #{summary}")
+      Logger.info("[metrics] #{summary}")
+    else
+      Logger.warning("[metrics] today's counters unavailable")
+    end
   end
 
   # ── package seams ────────────────────────────────────────────────────────────
@@ -220,7 +319,12 @@ defmodule Genswarms.Metrics do
   end
 
   defp store_today(store, fallback) do
-    if store?(store, :today_metrics, 0), do: store.today_metrics(), else: fallback
+    result = if store?(store, :today_metrics, 0), do: store.today_metrics(), else: fallback
+    if is_map(result), do: result, else: nil
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
   end
 
   # Module refs arrive as atoms (Elixir swarm defs) or strings (JSON IR).

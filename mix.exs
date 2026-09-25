@@ -18,7 +18,7 @@ defmodule GenswarmsObjects.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [extra_applications: [:logger, :crypto]]
   end
 
   # genswarms is a peer/runtime dependency provided by the host app (object
