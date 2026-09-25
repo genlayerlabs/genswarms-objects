@@ -116,7 +116,19 @@ defmodule Genswarms.CronDashboardTest do
       def load_cron_jobs(_), do: nil
     end
 
-    for store <- [NoSuchStoreModule, RaisingStore, ExitingStore, ErrorStore, NilStore] do
+    defmodule TruthfulStore do
+      def read_cron_jobs(_), do: nil
+      def load_cron_jobs(_), do: []
+    end
+
+    for store <- [
+          NoSuchStoreModule,
+          RaisingStore,
+          ExitingStore,
+          ErrorStore,
+          NilStore,
+          TruthfulStore
+        ] do
       assert %{"dashboard_pages" => [page], "cron" => cron} =
                Genswarms.Cron.dashboard_extension(store_mod: store)
 
@@ -131,7 +143,8 @@ defmodule Genswarms.CronDashboardTest do
 
   test "a successful empty reader remains a real zero" do
     defmodule EmptyStore do
-      def load_cron_jobs(_), do: []
+      def read_cron_jobs(_), do: []
+      def load_cron_jobs(_), do: raise("dashboard must prefer the truthful reader")
     end
 
     %{"dashboard_pages" => [page], "cron" => cron} =

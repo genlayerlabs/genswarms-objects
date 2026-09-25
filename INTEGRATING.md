@@ -122,6 +122,10 @@ the `@health_rules` module attribute) looks like:
 }
 ```
 
+Cron prefers the optional `read_cron_jobs(states)` callback for dashboard reads,
+falling back to `load_cron_jobs(states)`. Both return lists on success; the truthful
+reader must return nil/an error or raise on failure. This lets hosts retain a
+legacy scheduler reader without disguising dashboard query failures as empty jobs.
 Cron includes `"available" => true` only after a successful job read. An absent
 configured reader, exception/exit, nil or error result returns `"available" => false`,
 `"jobs" => nil`, and `"health_rules" => []`; its page shows unavailable cards.

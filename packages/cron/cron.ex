@@ -1473,9 +1473,16 @@ defmodule Genswarms.Cron do
   end
 
   defp safe_load_jobs(store_mod) do
-    if store_callback?(store_mod, :load_cron_jobs, 1) do
+    # Hosts may keep a legacy scheduler reader that falls back to []; prefer the
+    # truthful dashboard reader when supplied, without changing scheduler semantics.
+    reader =
+      if store_callback?(store_mod, :read_cron_jobs, 1),
+        do: :read_cron_jobs,
+        else: :load_cron_jobs
+
+    if store_callback?(store_mod, reader, 1) do
       # Preserve successful empty lists; nil/errors are unavailable, never zero jobs.
-      case store_mod.load_cron_jobs(@load_states) do
+      case apply(store_mod, reader, [@load_states]) do
         jobs when is_list(jobs) -> {:ok, Enum.map(jobs, &normalize_row_for_dashboard/1)}
         _ -> :unavailable
       end
