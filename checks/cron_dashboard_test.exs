@@ -99,12 +99,48 @@ defmodule Genswarms.CronDashboardTest do
     assert row["last_status"] == "ok"
   end
 
-  test "a dead store never raises out of the extension" do
-    assert %{"dashboard_pages" => [page]} =
-             Genswarms.Cron.dashboard_extension(store_mod: NoSuchStoreModule)
+  test "unavailable readers never render healthy zero jobs" do
+    defmodule RaisingStore do
+      def load_cron_jobs(_), do: raise("database unavailable")
+    end
 
-    assert [%{"items" => items} | _] = page["sections"]
-    assert %{"label" => "Jobs", "value" => 0} = Enum.find(items, &(&1["label"] == "Jobs"))
+    defmodule ExitingStore do
+      def load_cron_jobs(_), do: exit(:offline)
+    end
+
+    defmodule ErrorStore do
+      def load_cron_jobs(_), do: {:error, :offline}
+    end
+
+    defmodule NilStore do
+      def load_cron_jobs(_), do: nil
+    end
+
+    for store <- [NoSuchStoreModule, RaisingStore, ExitingStore, ErrorStore, NilStore] do
+      assert %{"dashboard_pages" => [page], "cron" => cron} =
+               Genswarms.Cron.dashboard_extension(store_mod: store)
+
+      assert cron["available"] == false
+      assert cron["jobs"] == nil
+      assert cron["health_rules"] == []
+      assert page["meta"] =~ "unavailable"
+      [%{"items" => items}] = page["sections"]
+      assert Enum.all?(items, &(&1["value"] == "Unavailable"))
+    end
+  end
+
+  test "a successful empty reader remains a real zero" do
+    defmodule EmptyStore do
+      def load_cron_jobs(_), do: []
+    end
+
+    %{"dashboard_pages" => [page], "cron" => cron} =
+      Genswarms.Cron.dashboard_extension(store_mod: EmptyStore)
+
+    assert cron["available"] == true
+    assert cron["jobs"] == []
+    [metrics, _] = page["sections"]
+    assert Enum.all?(metrics["items"], &(&1["value"] == 0))
   end
 
   test "without a store the machine block is absent too (still %{})" do
