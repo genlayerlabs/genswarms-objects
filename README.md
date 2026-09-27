@@ -11,7 +11,7 @@ swarms — one lockstep monorepo, four swarmidx packages (`kind: handler`):
 |---|---|---|
 | `cron` (`packages/cron`) | `Genswarms.Cron` | Deterministic global scheduler: a job = one schedule + one stamped message to one **allowlisted** target. One-shot, fixed-rate, and cron-expression schedules; in-place schedule updates; deterministic occurrence IDs; declarative seed_jobs; consecutive-failure breaker. Trust-gated sources, retry/backoff, bounded concurrency, persistence via injectable store. |
 | `browser` (`packages/browser`) | `Genswarms.Browser` | Web browser for agents: render/click/type/back with compact replies. Two modes — **allowlist** (fail-closed) or **denylist** (allow any public host except a blocklist; requires deployment-provided IP-filtering egress proxy for sub-resource SSRF containment). Note: `browse@0.1.1` is the old name's final release; use `browser@≥0.1.0`. |
-| `metrics` (`packages/metrics`) | `Genswarms.Metrics` | Fire-and-forget counters: closed key allowlist (a prompt-injected agent can't mint unbounded keys), in-memory totals, periodic flush to an injectable durable store. |
+| `metrics` (`packages/metrics`) | `Genswarms.Metrics` | Fire-and-forget counters: closed key allowlist (a prompt-injected agent can't mint unbounded keys), in-memory totals, immediate retry-safe UTC-day persistence with a compatible store. |
 | `tips` (`packages/tips`) | `Genswarms.Tips` | Rotating-content dispenser: per-recipient no-repeat rotation over fragment pools (configurable rotating + weighted-dressing slots), seeded deterministic `draw`/`commit` (a retried send reproduces the same message), pending→live→retired content lifecycle, injectable store. Makes no trust decisions — recipient selection and consent belong to the caller. |
 
 Extracted from wingston-rally-bot (browse, metrics) and micro-markets (cron) —
@@ -43,7 +43,22 @@ the duplication these repos carried before the registry existed.
   shapes (atom-keyed rows, the JSON round-trip, callback failure semantics);
   `Genswarms.Cron.Store` (packages/cron/store.ex) mirrors it as an optional
   `@behaviour` for compiler drift-checking.
-- **metrics**: `add_metrics(pending_map)`, `today_metrics()`.
+- **metrics**: `add_metrics_batch(batch_id, day, deltas)` returns `:ok` after
+  atomically deduplicating the opaque string ID and incrementing every delta, or
+  `{:error, reason}`. `day` is a UTC `Date`; deltas have allowlisted string keys
+  and positive integer values. Retrying an ID must never increment twice. IDs must
+  remain deduplicated for as long as retries are possible. `today_metrics()` returns
+  today's map; read failures should return an error/nil or raise, never a fake empty map.
+  Bumps write immediately; failures retry with the same ID/day/payload on the next
+  bump or timer. Later bumps coalesce per UTC day behind the immutable failed batch.
+  Successfully written counts survive restarts; **pending writes remain in memory
+  and can be lost on restart during an outage**. Buffers grow per outage day, not
+  per bump, with no day cap; a durable outbox is needed for outage crash recovery.
+  Snapshot `persistence.status` is `persisted`, `pending`, `best_effort` (legacy),
+  or `memory_only`; `last_error` is `write_failed` until a write succeeds.
+  Existing `add_metrics(pending_map)` stores keep periodic best-effort writes;
+  only `:ok` clears pending, but their retries may duplicate partial writes and
+  cannot guarantee event-day assignment. Upgrade the callback for those guarantees.
 - **tips**: `load_fragments()`, `load_seen()`, `save_fragment(fragment)`,
   `save_fragment_status(id, status)`, `add_seen(recipient_id, ids)`,
   `replace_seen(recipient_id, keep_ids)` — all optional, memory-only without

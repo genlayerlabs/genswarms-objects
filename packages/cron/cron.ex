@@ -1392,68 +1392,107 @@ defmodule Genswarms.Cron do
   def dashboard_extension(opts \\ []) do
     store_mod = Keyword.get(opts, :store_mod)
 
-    if is_nil(store_mod) do
-      %{}
-    else
-      jobs = safe_load_jobs(store_mod)
-      failing = Enum.count(jobs, &((&1[:last_status] || "ok") != "ok"))
-      paused = Enum.count(jobs, &(&1[:state] == "paused"))
+    case if(is_nil(store_mod), do: :unconfigured, else: safe_load_jobs(store_mod)) do
+      :unconfigured ->
+        %{}
 
-      %{
-        "dashboard_pages" => [
-          %{
-            "id" => "cron-jobs",
-            "label" => "Cron",
-            "icon" => "hero-clock",
-            "meta" => "#{length(jobs)} scheduled job(s)",
-            "sections" => [
-              %{
-                "type" => "metrics",
-                "title" => "Scheduler",
-                "items" => [
-                  %{"label" => "Jobs", "value" => length(jobs)},
-                  %{"label" => "Paused", "value" => paused},
-                  %{"label" => "Failing", "value" => failing}
-                ]
-              },
-              %{
-                "type" => "table",
-                "title" => "Jobs",
-                "meta" => "durable rows — survives a scheduler restart",
-                "columns" => [
-                  %{"key" => "name", "label" => "job"},
-                  %{"key" => "schedule", "label" => "schedule", "mono" => true},
-                  %{"key" => "target", "label" => "target", "mono" => true},
-                  %{"key" => "state", "label" => "state"},
-                  %{"key" => "next_run", "label" => "next run", "mono" => true},
-                  %{"key" => "last_status", "label" => "last", "align" => "right"},
-                  %{"key" => "failures", "label" => "consec fails", "align" => "right"}
-                ],
-                "rows" => Enum.map(jobs, &job_row/1)
-              }
-            ]
+      :unavailable ->
+        unavailable_dashboard()
+
+      {:ok, jobs} ->
+        failing = Enum.count(jobs, &((&1[:last_status] || "ok") != "ok"))
+        paused = Enum.count(jobs, &(&1[:state] == "paused"))
+
+        %{
+          "dashboard_pages" => [
+            %{
+              "id" => "cron-jobs",
+              "label" => "Cron",
+              "icon" => "hero-clock",
+              "meta" => "#{length(jobs)} scheduled job(s)",
+              "sections" => [
+                %{
+                  "type" => "metrics",
+                  "title" => "Scheduler",
+                  "items" => [
+                    %{"label" => "Jobs", "value" => length(jobs)},
+                    %{"label" => "Paused", "value" => paused},
+                    %{"label" => "Failing", "value" => failing}
+                  ]
+                },
+                %{
+                  "type" => "table",
+                  "title" => "Jobs",
+                  "meta" => "durable rows — survives a scheduler restart",
+                  "columns" => [
+                    %{"key" => "name", "label" => "job"},
+                    %{"key" => "schedule", "label" => "schedule", "mono" => true},
+                    %{"key" => "target", "label" => "target", "mono" => true},
+                    %{"key" => "state", "label" => "state"},
+                    %{"key" => "next_run", "label" => "next run", "mono" => true},
+                    %{"key" => "last_status", "label" => "last", "align" => "right"},
+                    %{"key" => "failures", "label" => "consec fails", "align" => "right"}
+                  ],
+                  "rows" => Enum.map(jobs, &job_row/1)
+                }
+              ]
+            }
+          ],
+          "cron" => %{
+            "v" => 1,
+            "available" => true,
+            "jobs" => Enum.map(jobs, &machine_job/1),
+            "health_rules" => @health_rules
           }
-        ],
-        "cron" => %{
-          "v" => 1,
-          "jobs" => Enum.map(jobs, &machine_job/1),
-          "health_rules" => @health_rules
         }
-      }
     end
   end
 
+  defp unavailable_dashboard do
+    %{
+      "dashboard_pages" => [
+        %{
+          "id" => "cron-jobs",
+          "label" => "Cron",
+          "icon" => "hero-clock",
+          "meta" => "Scheduler data unavailable",
+          "sections" => [
+            %{
+              "type" => "metrics",
+              "title" => "Scheduler",
+              "items" =>
+                Enum.map(["Jobs", "Paused", "Failing"], fn label ->
+                  %{"label" => label, "value" => "Unavailable"}
+                end)
+            }
+          ]
+        }
+      ],
+      "cron" => %{"v" => 1, "available" => false, "jobs" => nil, "health_rules" => []}
+    }
+  end
+
   defp safe_load_jobs(store_mod) do
-    if Code.ensure_loaded?(store_mod) and function_exported?(store_mod, :load_cron_jobs, 1) do
-      # Same normalization as boot: store rows are {id, state, data-json} wrappers;
-      # normalize_loaded_job unwraps to the atom-keyed job map job_row reads.
-      (store_mod.load_cron_jobs(@load_states) || [])
-      |> Enum.map(&normalize_row_for_dashboard/1)
+    # Hosts may keep a legacy scheduler reader that falls back to []; prefer the
+    # truthful dashboard reader when supplied, without changing scheduler semantics.
+    reader =
+      if store_callback?(store_mod, :read_cron_jobs, 1),
+        do: :read_cron_jobs,
+        else: :load_cron_jobs
+
+    if store_callback?(store_mod, reader, 1) do
+      # Preserve successful empty lists; nil/errors are unavailable, never zero jobs.
+      case apply(store_mod, reader, [@load_states]) do
+        jobs when is_list(jobs) -> {:ok, Enum.map(jobs, &normalize_row_for_dashboard/1)}
+        _ -> :unavailable
+      end
     else
-      []
+      :unavailable
     end
   rescue
-    _ -> []
+    _ -> :unavailable
+  catch
+    _, _ -> :unavailable
   end
 
   # Rows may arrive as raw store wrappers (%{id, state, data}) or as already-flat
