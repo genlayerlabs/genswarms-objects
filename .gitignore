@@ -2,3 +2,5 @@ _build/
 deps/
 erl_crash.dump
 *.beam
+
+node_modules/

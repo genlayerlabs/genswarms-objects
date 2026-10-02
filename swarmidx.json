@@ -38,6 +38,15 @@
       "docs": "README.md",
       "skill": ".claude/skills/genswarms-tips-use/SKILL.md",
       "module": "Genswarms.Tips"
+    },
+    {
+      "name": "genlayer",
+      "dir": "packages/genlayer",
+      "kind": "handler",
+      "description": "Experimental GenLayer testnet wallet object: sender-bound encrypted wallets, capability discovery, configured reads and EVM prepare/submit/status with durable recovery. Node 24+; operator-managed custody.",
+      "docs": "packages/genlayer/README.md",
+      "skill": "packages/genlayer/SKILL.md",
+      "module": "Genswarms.GenLayer"
     }
   ]
 }

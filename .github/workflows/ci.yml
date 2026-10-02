@@ -10,6 +10,16 @@ jobs:
         with:
           elixir-version: "1.16"
           otp-version: "26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci --prefix packages/genlayer --ignore-scripts
+      - run: npm test --prefix packages/genlayer
+      - run: npm run build --prefix packages/genlayer && node packages/genlayer/scripts/skill.mjs --check && git diff --exit-code -- packages/genlayer/runtime.mjs
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - run: GENLAYER_EVM_TEST=1 npm test --prefix packages/genlayer
       - run: mix deps.get
       - name: Standalone checks (checks/run.sh — globs checks/*_test.exs)
         run: sh checks/run.sh

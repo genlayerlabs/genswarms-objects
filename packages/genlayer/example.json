@@ -1,0 +1,15 @@
+{
+  "swarm_id": "my-swarm",
+  "agents": ["alice", "bob"],
+  "storage_dir": "/absolute/private/path/genlayer-wallets",
+  "master_key_file": "/absolute/private/path/genlayer-master.key",
+  "rpc_url": "https://rpc-bradbury.genlayer.com",
+  "chain_id": 4221,
+  "write_enabled": false,
+  "confirmations": 2,
+  "ttl_seconds": 60,
+  "max_native_value": "0",
+  "max_gas_cost": "0",
+  "gas_reserve": "0",
+  "recipes": {}
+}

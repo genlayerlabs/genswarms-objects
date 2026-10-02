@@ -5,10 +5,11 @@
 > [INTEGRATING.md](INTEGRATING.md).
 
 Utility object handlers for [genswarms](https://github.com/genlayerlabs/genswarms)
-swarms — one lockstep monorepo, four swarmidx packages (`kind: handler`):
+swarms — one lockstep monorepo, five swarmidx packages (`kind: handler`):
 
 | Package | Object | What it does |
 |---|---|---|
+| `genlayer` (`packages/genlayer`) | `Genswarms.GenLayer` | Experimental chain-4221 wallet object: encrypted per-sender custody, GenLayer reads and configured EVM execution. Node 24+. See [setup and limits](packages/genlayer/README.md). |
 | `cron` (`packages/cron`) | `Genswarms.Cron` | Deterministic global scheduler: a job = one schedule + one stamped message to one **allowlisted** target. One-shot, fixed-rate, and cron-expression schedules; in-place schedule updates; deterministic occurrence IDs; declarative seed_jobs; consecutive-failure breaker. Trust-gated sources, retry/backoff, bounded concurrency, persistence via injectable store. |
 | `browser` (`packages/browser`) | `Genswarms.Browser` | Web browser for agents: render/click/type/back with compact replies. Two modes — **allowlist** (fail-closed) or **denylist** (allow any public host except a blocklist; requires deployment-provided IP-filtering egress proxy for sub-resource SSRF containment). Note: `browse@0.1.1` is the old name's final release; use `browser@≥0.1.0`. |
 | `metrics` (`packages/metrics`) | `Genswarms.Metrics` | Fire-and-forget counters: closed key allowlist (a prompt-injected agent can't mint unbounded keys), in-memory totals, immediate retry-safe UTC-day persistence with a compatible store. |
@@ -17,7 +18,9 @@ swarms — one lockstep monorepo, four swarmidx packages (`kind: handler`):
 Extracted from wingston-rally-bot (browse, metrics) and micro-markets (cron) —
 the duplication these repos carried before the registry existed.
 
-## Conventions (all four)
+## Conventions (original four utility packages)
+
+The GenLayer custody package deliberately requires durable private storage and fails closed; the optional-store convention below does not apply to it.
 
 - **Config is pure data.** Module refs (`store_mod`/`store`/`events_mod`) arrive
   as atoms (Elixir defs) or strings (JSON IR); strings resolve via
