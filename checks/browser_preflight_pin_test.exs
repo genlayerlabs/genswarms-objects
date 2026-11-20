@@ -14,6 +14,20 @@ defmodule BrowserPreflightPinTest do
     assert List.last(args) == "https://example.com/x"
   end
 
+  test "head_args disables curl URL globbing; brackets/braces stay one literal URL arg" do
+    for url <- ["https://example.com/p[1-5]", "https://example.com/{a,b}?q=[x]"] do
+      args = Core.head_args(url, "1.2.3.4")
+      {opts, rest} = Enum.split_while(args, &(&1 != "--"))
+      assert "--globoff" in opts
+      assert rest == ["--", url]
+    end
+  end
+
+  test "gate rejects a percent-encoded host (curl would decode it past the pin)" do
+    pub = fn _ -> {:ok, [{93, 184, 216, 34}]} end
+    assert {:error, :bad_url} = Core.gate("https://exa%6dple.com/x", {:deny, MapSet.new()}, pub)
+  end
+
   test "resolve_and_pin rejects a host that resolves to a private IP" do
     priv = fn _ -> {:ok, [{10, 0, 0, 5}]} end
     assert {:error, :internal_ip} = Core.resolve_and_pin("internal.example", priv)
