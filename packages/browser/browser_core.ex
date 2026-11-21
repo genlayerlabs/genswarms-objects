@@ -39,7 +39,11 @@ defmodule Genswarms.Browser.Core do
   defp parse(url) do
     uri = URI.parse(url)
     host = if is_binary(uri.host), do: String.trim_trailing(uri.host, "."), else: nil
-    if is_binary(host) and host != "", do: {:ok, %{uri | host: host}}, else: {:error, :bad_url}
+    # `%` in a host: curl/browsers percent-decode it, URI.parse does not — the gate and
+    # the --resolve pin would vet a different name than the one actually connected to.
+    if is_binary(host) and host != "" and not String.contains?(host, "%"),
+      do: {:ok, %{uri | host: host}},
+      else: {:error, :bad_url}
   end
 
   defp https_only(%URI{scheme: "https"}), do: :ok
@@ -225,18 +229,29 @@ defmodule Genswarms.Browser.Core do
   # resolution gets curl (i.e. the engine) to connect to an internal service. So we
   # resolve+vet ONCE here too (`resolve_and_pin/1`) and pin curl to that vetted IP via
   # `--resolve`, which makes curl skip its own DNS for this host:port entirely.
+  @head_timeout_ms 15_000
   defp http_head(url) do
     host = URI.parse(url).host
 
     case resolve_and_pin(host) do
       {:ok, ip} ->
-        try do
-          case System.cmd(curl_bin(), head_args(url, ip), stderr_to_stdout: true) do
-            {out, 0} -> parse_curl_head(out)
-            {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
-          end
-        rescue
-          e -> {:error, {:curl_unavailable, Exception.message(e)}}
+        # Hard wall-clock cap: this runs inline in the shared browser object process, so
+        # a curl that outlives its own --max-time must not stall every conversation.
+        task =
+          Task.async(fn ->
+            try do
+              case System.cmd(curl_bin(), head_args(url, ip), stderr_to_stdout: true) do
+                {out, 0} -> parse_curl_head(out)
+                {out, code} -> {:error, {:curl_exit, code, String.slice(out, 0, 160)}}
+              end
+            rescue
+              e -> {:error, {:curl_unavailable, Exception.message(e)}}
+            end
+          end)
+
+        case Task.yield(task, @head_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+          {:ok, result} -> result
+          _ -> {:error, :head_timeout}
         end
 
       {:error, r} ->
@@ -252,7 +267,9 @@ defmodule Genswarms.Browser.Core do
     uri = URI.parse(url)
     port = uri.port || 443
     [
-      "-sS", "-o", "/dev/null", "-I", "--max-redirs", "0",
+      # --globoff: the URL is agent-supplied; without it `[1-5]`/`{a,b}` in the URL
+      # make ONE curl invocation send MANY requests.
+      "-sS", "--globoff", "-o", "/dev/null", "-I", "--max-redirs", "0",
       "--max-time", "10", "--connect-timeout", "5",
       "--resolve", "#{uri.host}:#{port}:#{ip_string}",
       "-w", "%{http_code} %{redirect_url}", "--", url
